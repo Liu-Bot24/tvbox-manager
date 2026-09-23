@@ -63,11 +63,11 @@
 
         <div class="glass-panel sub-box">
             <h3 style="margin-bottom: 0.5rem">🔗 我的专属订阅链接</h3>
-            <p style="color: var(--text-muted); font-size: 0.9rem;">将此链接填入 TVBOX/影视仓 的配置地址中即可使用</p>
+            <p style="color: var(--text-muted); font-size: 0.9rem;">导入的配置会合并为一份；在下方逐站点勾选后，将此地址填入 FongMi 点播配置。</p>
             <div class="sub-link" id="subLink">{{ sub_url }}</div>
             <div style="display: flex; align-items: center; justify-content: center; gap: 0.5rem; margin-top: 5px; margin-bottom: 15px;">
                 <input type="checkbox" id="onlyOnline" onchange="updateSubUrl()" style="width: 16px; height: 16px; cursor: pointer;">
-                <label for="onlyOnline" style="font-size: 0.85rem; color: var(--text-muted); cursor: pointer; user-select: none;">仅导出在线接口 (自动过滤异常源)</label>
+                <label for="onlyOnline" style="font-size: 0.85rem; color: var(--text-muted); cursor: pointer; user-select: none;">只导出已探测成功的站点（未探测站点也会被排除）</label>
             </div>
             <div style="display: flex; justify-content: center; gap: 1rem;">
                 <button class="btn btn-primary" style="width:auto" onclick="copyLink()">📋 复制链接</button>
@@ -86,13 +86,13 @@
                             <input type="text" id="name" class="form-control" placeholder="例如：阿里专线 / 直播源 A" required>
                         </div>
                         <div class="form-group">
-                            <label>接口地址 (URL)</label>
-                            <input type="url" id="url" class="form-control" placeholder="http://..." required>
+                            <label>配置或直播地址 (URL)</label>
+                            <input type="url" id="url" class="form-control" placeholder="https://.../config.json" required>
                         </div>
                         <div class="form-group">
                             <label>接口类型</label>
                             <select id="type" class="form-control" style="background: #111827">
-                                <option value="site">点播站源 (Site API)</option>
+                                <option value="site">TVBox JSON 配置</option>
                                 <option value="live">直播频道 (Live URL)</option>
                             </select>
                         </div>
@@ -119,7 +119,7 @@
 
             <div>
                 <div class="control-bar">
-                    <h3>📋 我的接口列表 (<span id="sourceCount">0</span>) <span style="font-size:0.8rem; font-weight:normal; color:var(--text-muted); margin-left:10px;">(左右拖拽卡片可打乱排序)</span></h3>
+                    <h3>📋 已导入配置 (<span id="sourceCount">0</span>) <span style="font-size:0.8rem; font-weight:normal; color:var(--text-muted); margin-left:10px;">拖动卡片可改变整合顺序</span></h3>
                     <button class="action-btn" onclick="loadSources()">🔄 刷新列表</button>
                 </div>
                 <div class="source-grid" id="sourceList"></div>
@@ -133,21 +133,39 @@
                 <h3>JSON 配置预览</h3>
                 <button class="close-modal" onclick="closeModal()">×</button>
             </div>
-            <div class="tabs">
-                <div class="tab active" data-type="multi" onclick="switchTab('multi', this)">多仓格式 (Default)</div>
-                <div class="tab" data-type="single" onclick="switchTab('single', this)">单仓格式 (Legacy)</div>
-            </div>
             <pre id="jsonPreview">加载中...</pre>
             <div style="margin-top: 1.5rem; display: flex; justify-content: flex-end; gap: 1rem;">
-                <button class="btn action-btn" style="width:auto" onclick="copySubLinkWithParams()">📋 复制该模式链接</button>
                 <button class="btn btn-primary" style="width:auto" onclick="copyPreview()">📋 复制预览内容</button>
             </div>
         </div>
     </div>
 
+    <div class="modal-overlay" id="sitesModal">
+        <div class="modal-content" style="max-width: 1050px;">
+            <div class="modal-header">
+                <h3 id="sitesTitle">站点</h3>
+                <button class="close-modal" onclick="closeSites()">×</button>
+            </div>
+            <p style="color:var(--text-muted); margin-bottom:1rem;">标准 CMS 源可检测搜索、详情与可直接访问的 HLS 首段。Spider/JAR 源需要电视端运行环境，这里会显示“暂不支持探测”。</p>
+            <div style="display:flex;gap:0.75rem;margin-bottom:1rem;">
+                <input id="probeKeyword" class="form-control" style="max-width:180px;padding:6px 10px" value="庆余年" aria-label="探测搜索词" placeholder="搜索词">
+                <button class="action-btn" onclick="loadSites(true)">刷新原始配置</button>
+                <button class="action-btn" id="probeAllButton" onclick="probeAllSites()">探测可支持的站点</button>
+            </div>
+            <div id="sitesList" class="sites-list"></div>
+        </div>
+    </div>
+
     <script>
-        let currentTab = 'multi';
+        let activeSourceId = null;
+        let activeSites = [];
         const subBaseUrl = "{{ sub_url }}";
+
+        function escapeHtml(value) {
+            return String(value).replace(/[&<>"']/g, char => ({
+                '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+            })[char]);
+        }
 
         function copyText(text) {
             if (navigator.clipboard && window.isSecureContext) {
@@ -186,13 +204,6 @@
             copyText(document.getElementById('jsonPreview').innerText).then(() => alert('✅ JSON 内容已复制'));
         }
 
-        function copySubLinkWithParams() {
-            const onlyOnline = document.getElementById('onlyOnline').checked;
-            let url = `${subBaseUrl}${subBaseUrl.includes('?') ? '&' : '?'}type=${currentTab}`;
-            if (onlyOnline) url += '&only_online=true';
-            copyText(url).then(() => alert(`✅ ${currentTab === 'multi' ? '多仓' : '单仓'}订阅链接已复制`));
-        }
-
         function openPreview() {
             document.getElementById('previewModal').style.display = 'flex';
             fetchPreview();
@@ -202,19 +213,12 @@
             document.getElementById('previewModal').style.display = 'none';
         }
 
-        function switchTab(type, el) {
-            currentTab = type;
-            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-            el.classList.add('active');
-            fetchPreview();
-        }
-
         async function fetchPreview() {
             const previewEl = document.getElementById('jsonPreview');
             previewEl.innerText = '// 正在生成预览...';
             const onlyOnline = document.getElementById('onlyOnline').checked;
-            let url = `/api/subscribe/{{ username }}.json?type=${currentTab}`;
-            if (onlyOnline) url += '&only_online=true';
+            let url = subBaseUrl;
+            if (onlyOnline) url += `${url.includes('?') ? '&' : '?'}only_online=true`;
             
             const res = await fetch(url);
             const text = await res.text();
@@ -245,33 +249,42 @@
                 card.style.cursor = 'grab'; // 提示可拖拽
                 card.innerHTML = `
                     <div class="source-header" style="cursor: grab;" active="cursor: grabbing;">
-                        <div class="source-title">${item.name}</div>
-                        <span class="status-badge status-checking" id="status-${item.id}">检查中...</span>
+                        <div class="source-title">${escapeHtml(item.name)}</div>
+                        <span class="status-badge ${item.status === 'online' ? 'status-online' : item.status === 'offline' ? 'status-offline' : 'status-checking'}" id="status-${item.id}">${item.status === 'online' ? '配置可达' : item.status === 'offline' ? '配置失败' : '未检测'}${item.latency_ms !== null ? ` · ${item.latency_ms} ms` : ''}</span>
                     </div>
-                    <div class="source-url">${item.url}</div>
+                    <div class="source-url">${escapeHtml(item.url)}</div>
                     <div class="source-footer">
-                        <span class="status-badge">${typeName}</span>
+                        <label style="display:flex;align-items:center;gap:0.4rem;font-size:0.8rem;"><input type="checkbox" class="source-enable" ${item.enabled ? 'checked' : ''}> 启用整份配置</label>
                         <div class="card-actions">
+                            ${item.type === 'site' ? `<button class="action-btn" onclick="openSites(${item.id}, this)" title="查看站点">站点 / 勾选</button>` : ''}
+                            <button class="action-btn" onclick="checkStatus(${item.id})" title="检测配置">测配置</button>
                             <button class="action-btn" onclick='prepareEdit(this)' data-item='${btoa(encodeURIComponent(JSON.stringify(item)))}' title="编辑">✏️</button>
-                            <button class="action-btn" onclick="copyText('${item.url}').then(()=>alert('链接已复制'))" title="复制链接">📋</button>
+                            <button class="action-btn copy-source" title="复制链接">📋</button>
                             <button class="action-btn delete" onclick="deleteSource(${item.id})" title="删除">🗑️</button>
                         </div>
                     </div>
                 `;
                 container.appendChild(card);
+                card.querySelector('.copy-source').addEventListener('click', () =>
+                    copyText(item.url).then(() => alert('链接已复制')));
+                card.querySelector('.source-enable').addEventListener('change', async (event) => {
+                    const box = event.target;
+                    box.disabled = true;
+                    try {
+                        const response = await fetch('/api/source/enable', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({id: item.id, enabled: box.checked})
+                        });
+                        const result = await response.json();
+                        if (result.status !== 'success') throw new Error(result.message);
+                    } catch (error) { box.checked = !box.checked; alert(error.message); }
+                    finally { box.disabled = false; }
+                });
             });
             
             // 初始化或刷新拖拽排序
             initSortable();
 
-            // 异步检查状态（带微量延迟，防止瞬间冲垮数据库）
-            const sleep = ms => new Promise(res => setTimeout(res, ms));
-            (async () => {
-                for (const item of json.data) {
-                    await checkStatus(item.id, item.url);
-                    await sleep(50); // 间隔 50ms 发送一个请求
-                }
-            })();
         }
 
         let sortableInstance = null;
@@ -282,6 +295,7 @@
             }
             sortableInstance = new Sortable(container, {
                 animation: 150,
+                filter: 'input, button',
                 delay: 100, // 给移动端稍加一点延迟防误触
                 delayOnTouchOnly: true,
                 onEnd: async function () {
@@ -303,17 +317,17 @@
             });
         }
 
-        async function checkStatus(id, url) {
+        async function checkStatus(id) {
             const el = document.getElementById(`status-${id}`);
             try {
                 const res = await fetch('/api/source/check', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({url, id})
+                    body: JSON.stringify({id})
                 });
                 const data = await res.json();
                 if(data.status === 'success' && data.status_val === 'online') {
-                    el.innerText = '在线';
+                    el.innerText = `配置可达 · ${data.latency_ms} ms`;
                     el.className = 'status-badge status-online';
                 } else {
                     el.innerText = '离线';
@@ -323,6 +337,120 @@
                 el.innerText = '超时';
                 el.className = 'status-badge status-offline';
             }
+        }
+
+        async function openSites(id, button) {
+            activeSourceId = id;
+            document.getElementById('sitesTitle').textContent = `${button.closest('.source-card').querySelector('.source-title').textContent} · 站点选择`;
+            document.getElementById('sitesModal').style.display = 'flex';
+            await loadSites(false);
+        }
+
+        function closeSites() {
+            document.getElementById('sitesModal').style.display = 'none';
+            activeSourceId = null;
+        }
+
+        async function loadSites(refresh) {
+            const sourceId = activeSourceId;
+            const list = document.getElementById('sitesList');
+            list.textContent = refresh ? '正在刷新原始配置...' : '正在读取站点...';
+            try {
+                const response = await fetch(`/api/source/${sourceId}/sites${refresh ? '?refresh=true' : ''}`);
+                const payload = await response.json();
+                if (sourceId !== activeSourceId) return;
+                if (payload.status !== 'success') throw new Error(payload.message);
+                activeSites = payload.data;
+                list.replaceChildren();
+                for (const site of activeSites) {
+                    const row = document.createElement('div');
+                    row.className = 'site-row';
+                    const box = document.createElement('input');
+                    box.type = 'checkbox';
+                    box.checked = site.enabled;
+                    box.setAttribute('aria-label', `启用 ${site.name}`);
+                    box.addEventListener('change', async () => {
+                        box.disabled = true;
+                        try {
+                            const res = await fetch('/api/site/enable', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify({source_id: sourceId, key: site.key, enabled: box.checked})
+                            });
+                            const data = await res.json();
+                            if (data.status !== 'success') throw new Error(data.message);
+                            site.enabled = box.checked;
+                        } catch (error) {
+                            box.checked = !box.checked;
+                            alert(error.message);
+                        } finally { box.disabled = false; }
+                    });
+                    const name = document.createElement('span');
+                    name.className = 'site-name';
+                    name.textContent = site.name;
+                    name.title = site.key;
+                    const result = document.createElement('span');
+                    result.className = 'site-result';
+                    result.textContent = describeProbe(site.result);
+                    const probe = document.createElement('button');
+                    probe.className = 'action-btn';
+                    probe.textContent = '探测';
+                    probe.addEventListener('click', () => probeOne(sourceId, site, result, probe));
+                    row.append(box, name, result, probe);
+                    list.appendChild(row);
+                }
+            } catch (error) {
+                list.textContent = `读取失败：${error.message}`;
+            }
+        }
+
+        function describeProbe(result) {
+            if (!result) return '未探测';
+            if (result.status === 'unsupported') return '暂不支持探测';
+            if (result.status !== 'online') return `失败 · ${result.stage || '请求'}${result.search_ms !== undefined ? ` · ${result.search_ms} ms` : ''}${result.error ? ` · ${result.error}` : ''}`;
+            const parts = [`搜索 ${result.search_ms} ms`, `详情 ${result.detail_ms} ms`];
+            if (result.playback === 'ok') parts.push(`播放首段 ${result.play_latency_ms} ms · ${result.speed_kbps} kbps`);
+            else if (result.playback === 'failed') parts.push('播放失败');
+            else parts.push('播放未验证');
+            return parts.join(' / ');
+        }
+
+        async function probeOne(sourceId, site, resultElement, button) {
+            button.disabled = true;
+            resultElement.textContent = '探测中...';
+            try {
+                const response = await fetch('/api/site/probe', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({source_id: sourceId, key: site.key, keyword: document.getElementById('probeKeyword').value})
+                });
+                const payload = await response.json();
+                if (payload.status !== 'success') throw new Error(payload.message);
+                site.result = payload.data;
+                resultElement.textContent = describeProbe(site.result);
+            } catch (error) { resultElement.textContent = `探测失败：${error.message}`; }
+            finally { button.disabled = false; }
+        }
+
+        async function probeAllSites() {
+            const button = document.getElementById('probeAllButton');
+            button.disabled = true;
+            const sourceId = activeSourceId;
+            const rows = [...document.querySelectorAll('#sitesList .site-row')];
+            const jobs = activeSites.map((site, index) => ({site, row: rows[index]}))
+                .filter(({site}) => [0, 1, 4].includes(site.type) && /^https?:\/\//.test(site.api));
+            let next = 0;
+            let done = 0;
+            button.textContent = `探测中 0/${jobs.length}`;
+            const worker = async () => {
+                while (next < jobs.length && activeSourceId === sourceId) {
+                    const index = next++;
+                    const {site, row} = jobs[index];
+                    await probeOne(sourceId, site, row.querySelector('.site-result'), row.querySelector('button'));
+                    button.textContent = `探测中 ${++done}/${jobs.length}`;
+                }
+            };
+            await Promise.all(Array.from({length: Math.min(4, jobs.length)}, worker));
+            button.disabled = false;
+            button.textContent = '探测可支持的站点';
         }
 
         function prepareEdit(btn) {

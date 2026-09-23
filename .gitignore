@@ -21,3 +21,4 @@ venv/
 # 系统文件
 .DS_Store
 database.db
+DEVELOPMENT_LOG.md

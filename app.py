@@ -5,11 +5,16 @@ import secrets
 import concurrent.futures
 import requests
 import logging
+import time
+from datetime import datetime, timezone
 from functools import wraps
+from contextlib import contextmanager
 from flask import Flask, request, session, redirect, url_for, render_template, jsonify, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib3
+from site_probe import load_config, probe_site, site_key
+from merge_config import merge_configs, normalize_resources
 
 # 禁用不安全请求警告（针对 verify=False）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -44,10 +49,18 @@ def handle_exception(e):
     return "系统异常，请稍后再试", 500
 
 # --- Database Layer ---
+@contextmanager
 def get_db():
     conn = sqlite3.connect(DATABASE, timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     """初始化数据库并建立索引"""
@@ -90,6 +103,22 @@ def init_db():
         db.execute('CREATE INDEX IF NOT EXISTS idx_sources_user ON sources(user_id)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_sources_url ON sources(url)')
         db.execute('CREATE INDEX IF NOT EXISTS idx_sources_order ON sources(order_index)')
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(sources)')}
+        for name, definition in (
+            ('enabled', 'INTEGER NOT NULL DEFAULT 1'),
+            ('latency_ms', 'INTEGER'),
+            ('checked_at', 'TEXT'),
+        ):
+            if name not in columns:
+                db.execute(f'ALTER TABLE sources ADD COLUMN {name} {definition}')
+        db.execute('''CREATE TABLE IF NOT EXISTS source_configs (
+            source_id INTEGER PRIMARY KEY, body TEXT NOT NULL, fetched_at TEXT NOT NULL
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS site_preferences (
+            source_id INTEGER NOT NULL, site_key TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1, result TEXT, checked_at TEXT,
+            PRIMARY KEY (source_id, site_key)
+        )''')
 
         # 初始化默认配置
         db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('invite_code', REG_CODE))
@@ -124,6 +153,31 @@ def jsonify_success(message='操作成功', **kwargs):
 
 def jsonify_error(message='操作失败', code=200):
     return jsonify({'status': 'error', 'message': message}), code
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def source_for_user(db, source_id, user_id):
+    return db.execute('SELECT * FROM sources WHERE id = ? AND user_id = ?', (source_id, user_id)).fetchone()
+
+
+def refresh_config(db, source):
+    config, latency_ms = load_config(source['url'])
+    config = normalize_resources(config, source['url'])
+    body = json.dumps(config, ensure_ascii=False)
+    db.execute('INSERT OR REPLACE INTO source_configs (source_id, body, fetched_at) VALUES (?, ?, ?)',
+               (source['id'], body, utc_now()))
+    db.execute('UPDATE sources SET status = ?, latency_ms = ?, checked_at = ? WHERE id = ?',
+               ('online', latency_ms, utc_now(), source['id']))
+    db.execute('UPDATE site_preferences SET result = NULL, checked_at = NULL WHERE source_id = ?', (source['id'],))
+    return config
+
+
+def cached_config(db, source):
+    row = db.execute('SELECT body FROM source_configs WHERE source_id = ?', (source['id'],)).fetchone()
+    return json.loads(row['body']) if row else refresh_config(db, source)
 
 def parse_aggregate_source(url):
     """尝试解析并解构多仓 JSON"""
@@ -289,8 +343,14 @@ def api_source_update():
     if not sid or not name or not url: return jsonify_error('参数不全')
 
     with get_db() as db:
+        old = source_for_user(db, sid, session['user_id'])
+        if not old: return jsonify_error('接口不存在', 404)
         db.execute('UPDATE sources SET name = ?, url = ?, type = ? WHERE id = ? AND user_id = ?', 
                    (name, url, stype, sid, session['user_id']))
+        if old['url'] != url:
+            db.execute('DELETE FROM source_configs WHERE source_id = ?', (sid,))
+            db.execute('DELETE FROM site_preferences WHERE source_id = ?', (sid,))
+            db.execute('UPDATE sources SET status = ?, latency_ms = NULL, checked_at = NULL WHERE id = ?', ('unknown', sid))
         db.commit()
     return jsonify_success('保存成功')
 
@@ -299,6 +359,8 @@ def api_source_update():
 def api_source_delete():
     source_id = request.json.get('id')
     with get_db() as db:
+        db.execute('DELETE FROM source_configs WHERE source_id = ? AND source_id IN (SELECT id FROM sources WHERE user_id = ?)', (source_id, session['user_id']))
+        db.execute('DELETE FROM site_preferences WHERE source_id = ? AND source_id IN (SELECT id FROM sources WHERE user_id = ?)', (source_id, session['user_id']))
         db.execute('DELETE FROM sources WHERE id = ? AND user_id = ?', (source_id, session['user_id']))
         db.commit()
     return jsonify_success('删除成功')
@@ -313,10 +375,27 @@ def api_source_reorder():
         db.commit()
     return jsonify_success('排序已保存')
 
+
+@app.route('/api/source/enable', methods=['POST'])
+@login_required
+def api_source_enable():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('enabled'), bool): return jsonify_error('参数错误', 400)
+    with get_db() as db:
+        source = source_for_user(db, data.get('id'), session['user_id'])
+        if not source: return jsonify_error('接口不存在', 404)
+        db.execute('UPDATE sources SET enabled = ? WHERE id = ?', (int(data['enabled']), source['id']))
+    return jsonify_success()
+
 @app.route('/api/source/check', methods=['POST'])
 @login_required
 def api_source_check():
     url, sid = request.json.get('url'), request.json.get('id')
+    if sid:
+        with get_db() as db:
+            source = source_for_user(db, sid, session['user_id'])
+            if not source: return jsonify_error('接口不存在', 404)
+            url = source['url']
     if not url: return jsonify_error('URL missing')
     
     headers = {
@@ -324,22 +403,98 @@ def api_source_check():
     }
     
     try:
+        start = time.monotonic()
         # 重归原生 requests.get 以提升对海量异构站点的兼容性，增加超时至 10s
         r = requests.get(url, timeout=10, stream=True, verify=False, headers=headers)
         r.close()
+        latency_ms = round((time.monotonic() - start) * 1000)
         status = 'online' if r.status_code < 400 else 'offline'
         if sid:
             with get_db() as db:
-                db.execute('UPDATE sources SET status = ? WHERE id = ? AND user_id = ?', (status, sid, session['user_id']))
+                db.execute('UPDATE sources SET status = ?, latency_ms = ?, checked_at = ? WHERE id = ? AND user_id = ?', (status, latency_ms, utc_now(), sid, session['user_id']))
                 db.commit()
-        return jsonify_success(status_val=status, code=r.status_code)
+        return jsonify_success(status_val=status, code=r.status_code, latency_ms=latency_ms)
     except Exception as e:
         logger.error(f"Check failed for {url}: {str(e)}")
         if sid:
             with get_db() as db:
-                db.execute('UPDATE sources SET status = ? WHERE id = ? AND user_id = ?', ('offline', sid, session['user_id']))
+                db.execute('UPDATE sources SET status = ?, latency_ms = NULL, checked_at = ? WHERE id = ? AND user_id = ?', ('offline', utc_now(), sid, session['user_id']))
                 db.commit()
         return jsonify_error(str(e))
+
+
+@app.route('/api/source/<int:source_id>/sites')
+@login_required
+def api_source_sites(source_id):
+    refresh = request.args.get('refresh') == 'true'
+    with get_db() as db:
+        source = source_for_user(db, source_id, session['user_id'])
+        if not source: return jsonify_error('接口不存在', 404)
+        try:
+            config = refresh_config(db, source) if refresh else cached_config(db, source)
+        except (requests.RequestException, ValueError, UnicodeError) as exc:
+            db.execute('UPDATE sources SET status = ?, checked_at = ? WHERE id = ?', ('offline', utc_now(), source_id))
+            return jsonify_error(f'配置读取失败：{exc}', 502)
+        prefs = {row['site_key']: dict(row) for row in db.execute(
+            'SELECT * FROM site_preferences WHERE source_id = ?', (source_id,))}
+        sites = []
+        for site in config['sites']:
+            if not isinstance(site, dict) or not site_key(site): continue
+            pref = prefs.get(site_key(site), {})
+            sites.append({
+                'key': site_key(site), 'name': site.get('name') or site_key(site),
+                'type': site.get('type'), 'api': site.get('api', ''),
+                'enabled': bool(pref.get('enabled', 1)),
+                'result': json.loads(pref['result']) if pref.get('result') else None,
+                'checked_at': pref.get('checked_at'),
+            })
+        return jsonify_success(data=sites)
+
+
+@app.route('/api/site/enable', methods=['POST'])
+@login_required
+def api_site_enable():
+    data = request.get_json(silent=True) or {}
+    source_id, key, enabled = data.get('source_id'), data.get('key'), data.get('enabled')
+    if not isinstance(key, str) or not key or not isinstance(enabled, bool):
+        return jsonify_error('参数错误', 400)
+    with get_db() as db:
+        source = source_for_user(db, source_id, session['user_id'])
+        if not source: return jsonify_error('接口不存在', 404)
+        try:
+            config = cached_config(db, source)
+        except (requests.RequestException, ValueError, UnicodeError) as exc:
+            return jsonify_error(f'配置读取失败：{exc}', 502)
+        if key not in {site_key(site) for site in config['sites'] if isinstance(site, dict)}:
+            return jsonify_error('站点不存在', 404)
+        db.execute('''INSERT INTO site_preferences (source_id, site_key, enabled) VALUES (?, ?, ?)
+            ON CONFLICT(source_id, site_key) DO UPDATE SET enabled = excluded.enabled''',
+            (source_id, key, int(enabled)))
+    return jsonify_success()
+
+
+@app.route('/api/site/probe', methods=['POST'])
+@login_required
+def api_site_probe():
+    data = request.get_json(silent=True) or {}
+    source_id, key = data.get('source_id'), data.get('key')
+    keyword = str(data.get('keyword') or '庆余年').strip()[:40]
+    if not keyword: return jsonify_error('请输入搜索词', 400)
+    with get_db() as db:
+        source = source_for_user(db, source_id, session['user_id'])
+        if not source: return jsonify_error('接口不存在', 404)
+        try:
+            config = cached_config(db, source)
+        except (requests.RequestException, ValueError, UnicodeError) as exc:
+            return jsonify_error(f'配置读取失败：{exc}', 502)
+        site = next((item for item in config['sites'] if isinstance(item, dict) and site_key(item) == key), None)
+        if not site: return jsonify_error('站点不存在', 404)
+        result = probe_site(site, keyword)
+        db.execute('''INSERT INTO site_preferences (source_id, site_key, result, checked_at)
+            VALUES (?, ?, ?, ?) ON CONFLICT(source_id, site_key)
+            DO UPDATE SET result = excluded.result, checked_at = excluded.checked_at''',
+            (source_id, key, json.dumps(result, ensure_ascii=False), utc_now()))
+    return jsonify_success(data=result)
 
 # --- Recommendation & External APIs ---
 @app.route('/api/external/aipan')
@@ -423,6 +578,10 @@ def api_admin_users():
 def api_admin_users_delete():
     uid = request.json.get('id')
     with get_db() as db:
+        db.execute('''DELETE FROM source_configs WHERE source_id IN
+            (SELECT id FROM sources WHERE user_id = ?)''', (uid,))
+        db.execute('''DELETE FROM site_preferences WHERE source_id IN
+            (SELECT id FROM sources WHERE user_id = ?)''', (uid,))
         db.execute('DELETE FROM sources WHERE user_id = ?', (uid,))
         db.execute('DELETE FROM users WHERE id = ?', (uid,))
         db.commit()
@@ -455,29 +614,37 @@ def api_admin_push_recommendations():
 # --- Public Subscription API ---
 @app.route('/api/subscribe/<username>.json')
 def get_tvbox_json(username):
-    etype, only_online = request.args.get('type', 'multi'), request.args.get('only_online') == 'true'
+    only_online = request.args.get('only_online') == 'true'
     
     with get_db() as db:
         user = db.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
         if not user: return jsonify_error('用户不存在', 404)
             
-        sql = 'SELECT * FROM sources WHERE user_id = ?' + (' AND status = "online"' if only_online else '') + ' ORDER BY order_index ASC, id ASC'
+        sql = 'SELECT * FROM sources WHERE user_id = ? AND enabled = 1 ORDER BY order_index ASC, id ASC'
         sources = db.execute(sql, (user['id'],)).fetchall()
-    
-    if etype == 'single':
-        config = { "sites": [], "lives": [{"name": "live", "type": 0, "url": "", "playerType": 1}] }
-        lives = []
-        for r in sources:
-            if r['type'] == 'site':
-                config["sites"].append({"key": f"s_{r['id']}", "name": r['name'], "type": 3, "api": "csp_XBPQ", "ext": r['url']})
-            else: lives.append(f"{r['name']}, {r['url']}")
-        if lives: config["lives"][0]["url"] = "#".join(lives)
-    else:
-        config = {"urls": [{"url": r['url'], "name": r['name']} for r in sources]}
-            
+        inputs = []
+        direct_lives = []
+        for source in sources:
+            if source['type'] == 'live':
+                direct_lives.append({'name': source['name'], 'type': 0, 'url': source['url']})
+                continue
+            try:
+                inputs.append((source['id'], cached_config(db, source)))
+            except (requests.RequestException, ValueError, UnicodeError) as exc:
+                logger.warning('Unable to load config %s: %s', source['id'], exc)
+                return jsonify_error(f'无法读取「{source["name"]}」，请刷新配置后重试', 502)
+        preferences = {}
+        for row in db.execute('''SELECT p.source_id, p.site_key, p.enabled, p.result
+            FROM site_preferences p JOIN sources s ON s.id = p.source_id WHERE s.user_id = ?''', (user['id'],)):
+            result = json.loads(row['result']) if row['result'] else {}
+            preferences[(row['source_id'], row['site_key'])] = {
+                'enabled': bool(row['enabled']), 'status': result.get('status')}
+        config = merge_configs(inputs, preferences, only_online)
+        config['lives'].extend(direct_lives)
+
     json_str = json.dumps(config, indent=4, ensure_ascii=False)
     if request.args.get('comment') == 'true':
-        json_str = f"//TVBox 专属配置 - {'多仓' if etype == 'multi' else '单仓'}\n" + json_str
+        json_str = '//TVBox 整合配置\n' + json_str
     
     res = Response(json_str, mimetype='application/json; charset=utf-8')
     res.headers.add('Access-Control-Allow-Origin', '*')

@@ -292,3 +292,21 @@ pre#jsonPreview {
     letter-spacing: 0.5px;
     text-transform: uppercase;
 }
+
+.sites-list { display: flex; flex-direction: column; gap: 0.45rem; }
+.site-row {
+    display: grid;
+    grid-template-columns: 22px minmax(100px, 1fr) minmax(190px, 2fr) auto;
+    align-items: center;
+    gap: 0.8rem;
+    padding: 0.75rem;
+    border: 1px solid var(--border-glass);
+    border-radius: 8px;
+}
+.site-row input { width: 18px; height: 18px; }
+.site-name { font-weight: 600; overflow-wrap: anywhere; }
+.site-result { color: var(--text-muted); font-size: 0.82rem; overflow-wrap: anywhere; }
+@media (max-width: 650px) {
+    .site-row { grid-template-columns: 22px minmax(0, 1fr) auto; }
+    .site-result { grid-column: 2 / 4; }
+}

@@ -1,21 +1,14 @@
-version: '3.8'
-
 services:
   tvbox-manager:
-    # 模式 A：本地构建（1Panel 常用）。FNOS 无法自动发现此类更新，建议手动 Pull 或 Rebuild。
-    # build: .
-    
-    # 模式 B：镜像模式（推荐给 FNOS 用户）。当您推送新镜像到仓库后，飞牛OS 能自动发现 Digest 变化。
-    # 请将下面的 'yourusername' 替换为您的 Docker Hub 用户名
-    image: eastar23/tvbox-manager:latest
+    build: .
+    image: tvbox-manager-local:site-probes
     container_name: tvbox-manager
     ports:
       - "8089:8089"
-    # 如果您直接修改本文件，请确保以下参数符合您的实际情况：
     environment:
-      - REG_CODE=888888          # 用户注册时的邀请码
-      - SECRET_KEY=change_me_now  # Flask Session 密钥，请务必修改
-      - BASE_URL=                 # 外部访问基础 URL，一般留空即可自动识别
+      REG_CODE: ${REG_CODE:-888888}
+      SECRET_KEY: ${SECRET_KEY:?请在 .env 中设置 SECRET_KEY}
+      BASE_URL: ${BASE_URL:-}
     volumes:
-      - ./data:/app/data         # 冒号左边 ./data 是您服务器上的持久化目录
+      - ${DATA_DIR:-./data}:/app/data
     restart: unless-stopped
