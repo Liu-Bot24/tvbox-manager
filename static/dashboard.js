@@ -94,7 +94,9 @@ function batchTargets(action) {
 }
 function renderBatchPreview() {
   const action = $('batchAction').value, count = batchTargets(action).length;
-  $('batchPreview').textContent = action ? `将影响 ${count} 个站点` : '选择操作后显示影响数量';
+  const scope = action.endsWith('_group') ? (currentGroup === 'all' ? '全部站点' : `「${$('currentGroupTitle').textContent}」分组`)
+    : action.endsWith('_visible') ? '当前筛选结果' : '全部站点';
+  $('batchPreview').textContent = action ? `${scope}：将影响 ${count} 个站点` : '选择操作后显示影响数量';
   $('applyBatch').disabled = !count;
 }
 async function applyBatch() {
