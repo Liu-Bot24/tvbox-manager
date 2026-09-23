@@ -29,14 +29,15 @@ function visibleSites() {
     return match && (filter === 'all' || (filter === 'enabled' && site.enabled) || (filter === 'disabled' && !site.enabled) || (filter === 'online' && status === 'online') || (filter === 'failed' && status === 'failed') || (filter === 'unprobed' && !site.result));
   });
   if ($('sortSites').value === 'name') shown.sort((a,b) => String(a.name).localeCompare(String(b.name), 'zh-CN'));
-  if ($('sortSites').value === 'latency') shown.sort((a,b) => (a.result?.search_ms ?? Infinity) - (b.result?.search_ms ?? Infinity));
+  if ($('sortSites').value === 'latency') shown.sort((a,b) => (a.result?.search_ms ?? a.result?.resource_ms ?? Infinity) - (b.result?.search_ms ?? b.result?.resource_ms ?? Infinity));
   return shown;
 }
 function probeLabel(result) {
   if (!result) return ['未探测', ''];
   if (result.status === 'online') return [result.playback === 'ok' ? '播放首段可达' : '搜索与详情可用', 'online'];
+  if (result.status === 'resource_only') return [`资源可达 · ${result.resource_ms} ms`, 'resource'];
   if (result.status === 'unsupported') return ['需电视端验证', 'unsupported'];
-  return [`${result.stage || '请求'}失败`, 'failed'];
+  return [`${({search:'搜索',detail:'详情',playback:'播放',resource:'资源访问'})[result.stage] || '请求'}失败`, 'failed'];
 }
 function metric(value, suffix = '') { return value === undefined || value === null ? '—' : `${escapeHtml(value)}${suffix}`; }
 function rowId(site) { return `${site.source_id}:${site.key}`; }
@@ -75,8 +76,8 @@ async function probeOne(site, button) {
 }
 async function probeVisible() {
   if (busyProbing) return;
-  const jobs = visibleSites().filter(site => [0,1,4].includes(site.type) && /^https?:\/\//.test(site.api || ''));
-  if (!jobs.length) { toast('当前列表没有可在 NAS 探测的 CMS 站点'); return; }
+  const jobs = visibleSites();
+  if (!jobs.length) { toast('当前列表没有站点'); return; }
   busyProbing = true;
   $('probeVisible').disabled = true;
   let next = 0, done = 0;
@@ -89,7 +90,7 @@ async function probeVisible() {
       $('probeProgress').textContent = `探测中 ${done} / ${jobs.length}`;
     }
   };
-  await Promise.all(Array.from({length:Math.min(4,jobs.length)}, worker));
+  await Promise.all(Array.from({length:Math.min(6,jobs.length)}, worker));
   $('probeProgress').textContent = `已完成 ${done} 个站点`;
   $('probeVisible').disabled = false;
   busyProbing = false;

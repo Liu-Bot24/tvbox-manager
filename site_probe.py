@@ -1,8 +1,4 @@
-"""Bounded probes for JSON TVBox configurations and standard CMS sites.
-
-Spider/JAR sites need the TV client runtime and are deliberately reported as
-unsupported rather than being mistaken for working sites.
-"""
+"""Bounded CMS probes and honest resource checks for TVBox sites."""
 
 import json
 import time
@@ -117,10 +113,34 @@ def media_probe(url):
     }
 
 
+def spider_resource_url(site):
+    """Return a site-specific HTTP resource, never a shared Spider JAR."""
+    ext = site.get('ext')
+    candidates = [ext, site.get('api')]
+    if isinstance(ext, dict):
+        candidates = [ext.get(name) for name in ('url', 'host', 'siteUrl', 'site')] + candidates
+    for candidate in candidates:
+        if not isinstance(candidate, str) or '{' in candidate or '}' in candidate:
+            continue
+        parts = urlsplit(candidate.strip())
+        if parts.scheme in ('http', 'https') and parts.netloc:
+            return candidate.strip()
+    return None
+
+
 def probe_site(site, keyword='测试'):
     """Search, detail, then optionally sample HLS for a standard CMS API."""
     api = str(site.get('api') or '').strip()
     kind = site.get('type')
+    if kind == 3:
+        resource = spider_resource_url(site)
+        if not resource:
+            return {'status': 'unsupported', 'stage': '需电视端运行环境；没有独立 HTTP 资源可测'}
+        try:
+            _, resource_ms = fetch_limited(resource, 32768, truncate=True)
+            return {'status': 'resource_only', 'stage': 'resource', 'resource_ms': resource_ms}
+        except (requests.RequestException, ValueError, UnicodeError) as exc:
+            return {'status': 'failed', 'stage': 'resource', 'error': str(exc)[:180]}
     if kind not in (0, 1, 4) or not api.startswith(('http://', 'https://')):
         return {'status': 'unsupported', 'stage': 'CMS 外部探测不支持此类站点'}
     stage = 'search'

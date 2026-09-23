@@ -65,6 +65,20 @@ class ProbeTests(unittest.TestCase):
         result = probe_site({'type': 3, 'api': 'csp_Example'})
         self.assertEqual(result['status'], 'unsupported')
 
+    @patch('site_probe.fetch_limited', return_value=(b'// script', 42))
+    def test_spider_script_reports_resource_latency_without_claiming_playback(self, fetch):
+        result = probe_site({'type': 3, 'api': 'csp_Example',
+                             'ext': 'https://example.org/script.js'})
+        self.assertEqual(result, {'status': 'resource_only', 'stage': 'resource', 'resource_ms': 42})
+        self.assertEqual(fetch.call_args.args[0], 'https://example.org/script.js')
+
+    def test_spider_template_url_does_not_trigger_network_probe(self):
+        with patch('site_probe.fetch_limited') as fetch:
+            result = probe_site({'type': 3, 'api': 'csp_Example',
+                                 'ext': {'url': 'https://example.org/{id}'}})
+        self.assertEqual(result['status'], 'unsupported')
+        fetch.assert_not_called()
+
     @patch('site_probe.fetch_limited', return_value=(b'{"list":[]}', 35))
     def test_empty_search_is_failure(self, fetch):
         result = probe_site({'type': 1, 'api': 'https://example.org/api'})
