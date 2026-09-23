@@ -6,7 +6,7 @@
 
 1. 将 `.env.example` 复制为 `.env`，修改 `SECRET_KEY` 和邀请码。
 2. 在本目录运行 `docker compose up -d --build`。
-3. 打开 `http://NAS-IP:8089` 注册并登录；首个用户是管理员。
+3. 打开 `http://192.168.6.237:8089` 注册并登录；首个用户是管理员。默认 Compose 只绑定此局域网地址，若 NAS 地址不同，请修改 `docker-compose.yml` 的端口映射。
 4. 添加需要合并的 TVBox JSON 配置地址。配置顺序决定全局选项的优先级，第一份配置提供默认选项。
 5. 在“站点 / 勾选”中刷新配置、按需探测并选择站点。
 6. 将页面显示的 `/api/subscribe/用户名.json` 地址填入 FongMi 的点播配置。
