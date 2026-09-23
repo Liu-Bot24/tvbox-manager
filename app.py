@@ -15,6 +15,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 import urllib3
 from site_probe import load_config, probe_site, site_key
 from merge_config import merge_configs, normalize_resources
+from grouping import PRESET_GROUPS, PROVIDERS, preset_group_for, fernet_for_secret, classify_with_jev
 
 # 禁用不安全请求警告（针对 verify=False）
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -121,6 +122,29 @@ def init_db():
             enabled INTEGER NOT NULL DEFAULT 1, result TEXT, checked_at TEXT,
             PRIMARY KEY (source_id, site_key)
         )''')
+        preference_columns = {row['name'] for row in db.execute('PRAGMA table_info(site_preferences)')}
+        if 'group_id' not in preference_columns:
+            db.execute('ALTER TABLE site_preferences ADD COLUMN group_id INTEGER')
+        db.execute('''CREATE TABLE IF NOT EXISTS site_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+            order_index INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(user_id, name)
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS group_bootstrap (
+            user_id INTEGER PRIMARY KEY, created_at TEXT NOT NULL
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS model_settings (
+            user_id INTEGER PRIMARY KEY, provider TEXT NOT NULL,
+            model TEXT NOT NULL, encrypted_key TEXT NOT NULL
+        )''')
+        db.execute('''CREATE TABLE IF NOT EXISTS group_suggestions (
+            user_id INTEGER NOT NULL, source_id INTEGER NOT NULL, site_key TEXT NOT NULL,
+            context_group_id INTEGER, suggested_group_id INTEGER,
+            confidence REAL NOT NULL, membership REAL,
+            probabilities TEXT NOT NULL, created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, source_id, site_key)
+        )''')
 
         # 初始化默认配置
         db.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', ('invite_code', REG_CODE))
@@ -174,12 +198,76 @@ def refresh_config(db, source):
     db.execute('UPDATE sources SET status = ?, latency_ms = ?, checked_at = ? WHERE id = ?',
                ('online', latency_ms, utc_now(), source['id']))
     db.execute('UPDATE site_preferences SET result = NULL, checked_at = NULL WHERE source_id = ?', (source['id'],))
+    db.execute('DELETE FROM group_suggestions WHERE source_id = ?', (source['id'],))
     return config
 
 
 def cached_config(db, source):
     row = db.execute('SELECT body FROM source_configs WHERE source_id = ?', (source['id'],)).fetchone()
     return json.loads(row['body']) if row else refresh_config(db, source)
+
+
+def ensure_groups_bootstrapped(db, user_id):
+    if db.execute('SELECT 1 FROM group_bootstrap WHERE user_id = ?', (user_id,)).fetchone():
+        return
+    for index, (name, description, _) in enumerate(PRESET_GROUPS):
+        db.execute('''INSERT OR IGNORE INTO site_groups (user_id, name, description, order_index)
+            VALUES (?, ?, ?, ?)''', (user_id, name, description, index))
+    groups_by_name = {row['name']: row['id'] for row in db.execute(
+        'SELECT id, name FROM site_groups WHERE user_id = ?', (user_id,))}
+    sources = db.execute("SELECT * FROM sources WHERE user_id = ? AND type = 'site'", (user_id,)).fetchall()
+    for source in sources:
+        try:
+            config = cached_config(db, source)
+        except (requests.RequestException, ValueError, UnicodeError):
+            continue
+        for site in config.get('sites') or []:
+            if not isinstance(site, dict) or not site_key(site):
+                continue
+            name = preset_group_for(site)
+            if name:
+                db.execute('''INSERT INTO site_preferences (source_id, site_key, group_id)
+                    VALUES (?, ?, ?) ON CONFLICT(source_id, site_key)
+                    DO UPDATE SET group_id = COALESCE(site_preferences.group_id, excluded.group_id)''',
+                    (source['id'], site_key(site), groups_by_name[name]))
+    db.execute('INSERT INTO group_bootstrap (user_id, created_at) VALUES (?, ?)', (user_id, utc_now()))
+
+
+def owned_site_refs(db, user_id, refs):
+    if not isinstance(refs, list) or not 1 <= len(refs) <= 2000:
+        raise ValueError('请选择 1 至 2000 个站点')
+    sources = {row['id']: row for row in db.execute(
+        "SELECT * FROM sources WHERE user_id = ? AND type = 'site'", (user_id,))}
+    valid_keys = {}
+    answer = []
+    seen = set()
+    for ref in refs:
+        if not isinstance(ref, dict) or not isinstance(ref.get('source_id'), int) or not isinstance(ref.get('key'), str):
+            raise ValueError('站点参数错误')
+        source_id, key = ref['source_id'], ref['key']
+        if source_id not in sources or not key:
+            raise ValueError('站点不属于当前用户')
+        if source_id not in valid_keys:
+            config = cached_config(db, sources[source_id])
+            valid_keys[source_id] = {site_key(site) for site in config.get('sites') or [] if isinstance(site, dict)}
+        if key not in valid_keys[source_id]:
+            raise ValueError('站点不存在')
+        if (source_id, key) not in seen:
+            answer.append((source_id, key))
+            seen.add((source_id, key))
+    return answer
+
+
+def group_for_user(db, user_id, group_id):
+    if group_id is None:
+        return None
+    if not isinstance(group_id, int):
+        raise ValueError('分组参数错误')
+    group = db.execute('SELECT * FROM site_groups WHERE id = ? AND user_id = ?',
+                       (group_id, user_id)).fetchone()
+    if not group:
+        raise ValueError('分组不存在')
+    return group
 
 def parse_aggregate_source(url):
     """尝试解析并解构多仓 JSON"""
@@ -317,6 +405,7 @@ def api_all_sites():
                     'key': key, 'name': site.get('name') or key,
                     'type': site.get('type'), 'api': site.get('api', ''),
                     'enabled': bool(pref.get('enabled', 1)),
+                    'group_id': pref.get('group_id'),
                     'result': json.loads(pref['result']) if pref.get('result') else None,
                     'checked_at': pref.get('checked_at'),
                 })
@@ -386,6 +475,7 @@ def api_source_update():
         if old['url'] != url:
             db.execute('DELETE FROM source_configs WHERE source_id = ?', (sid,))
             db.execute('DELETE FROM site_preferences WHERE source_id = ?', (sid,))
+            db.execute('DELETE FROM group_suggestions WHERE source_id = ?', (sid,))
             db.execute('UPDATE sources SET status = ?, latency_ms = NULL, checked_at = NULL WHERE id = ?', ('unknown', sid))
         db.commit()
     return jsonify_success('保存成功')
@@ -397,6 +487,7 @@ def api_source_delete():
     with get_db() as db:
         db.execute('DELETE FROM source_configs WHERE source_id = ? AND source_id IN (SELECT id FROM sources WHERE user_id = ?)', (source_id, session['user_id']))
         db.execute('DELETE FROM site_preferences WHERE source_id = ? AND source_id IN (SELECT id FROM sources WHERE user_id = ?)', (source_id, session['user_id']))
+        db.execute('DELETE FROM group_suggestions WHERE source_id = ? AND user_id = ?', (source_id, session['user_id']))
         db.execute('DELETE FROM sources WHERE id = ? AND user_id = ?', (source_id, session['user_id']))
         db.commit()
     return jsonify_success('删除成功')
@@ -509,6 +600,260 @@ def api_site_enable():
     return jsonify_success()
 
 
+@app.route('/api/site/batch_enable', methods=['POST'])
+@login_required
+def api_site_batch_enable():
+    data = request.get_json(silent=True) or {}
+    if not isinstance(data.get('enabled'), bool):
+        return jsonify_error('启用状态无效', 400)
+    with get_db() as db:
+        try:
+            refs = owned_site_refs(db, session['user_id'], data.get('sites'))
+        except (ValueError, requests.RequestException, UnicodeError) as exc:
+            return jsonify_error(str(exc), 400)
+        for source_id, key in refs:
+            db.execute('''INSERT INTO site_preferences (source_id, site_key, enabled) VALUES (?, ?, ?)
+                ON CONFLICT(source_id, site_key) DO UPDATE SET enabled = excluded.enabled''',
+                (source_id, key, int(data['enabled'])))
+    return jsonify_success(f'已更新 {len(refs)} 个站点', count=len(refs))
+
+
+@app.route('/api/group/list')
+@login_required
+def api_group_list():
+    with get_db() as db:
+        ensure_groups_bootstrapped(db, session['user_id'])
+        groups = [dict(row) for row in db.execute('''SELECT id, name, description, order_index
+            FROM site_groups WHERE user_id = ? ORDER BY order_index, id''', (session['user_id'],))]
+    return jsonify_success(data=groups)
+
+
+@app.route('/api/group/add', methods=['POST'])
+@login_required
+def api_group_add():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name') or '').strip()[:40]
+    description = str(data.get('description') or '').strip()[:240]
+    if not name:
+        return jsonify_error('请输入分组名称', 400)
+    with get_db() as db:
+        ensure_groups_bootstrapped(db, session['user_id'])
+        order = db.execute('SELECT COALESCE(MAX(order_index), -1) + 1 FROM site_groups WHERE user_id = ?',
+                           (session['user_id'],)).fetchone()[0]
+        try:
+            cursor = db.execute('''INSERT INTO site_groups (user_id, name, description, order_index)
+                VALUES (?, ?, ?, ?)''', (session['user_id'], name, description, order))
+        except sqlite3.IntegrityError:
+            return jsonify_error('分组名称已存在', 409)
+        db.execute('DELETE FROM group_suggestions WHERE user_id = ?', (session['user_id'],))
+    return jsonify_success(group_id=cursor.lastrowid)
+
+
+@app.route('/api/group/update', methods=['POST'])
+@login_required
+def api_group_update():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get('name') or '').strip()[:40]
+    description = str(data.get('description') or '').strip()[:240]
+    if not name:
+        return jsonify_error('请输入分组名称', 400)
+    with get_db() as db:
+        try:
+            group = group_for_user(db, session['user_id'], data.get('id'))
+        except ValueError as exc:
+            return jsonify_error(str(exc), 404)
+        try:
+            db.execute('UPDATE site_groups SET name = ?, description = ? WHERE id = ?',
+                       (name, description, group['id']))
+        except sqlite3.IntegrityError:
+            return jsonify_error('分组名称已存在', 409)
+        db.execute('DELETE FROM group_suggestions WHERE user_id = ?', (session['user_id'],))
+    return jsonify_success()
+
+
+@app.route('/api/group/delete', methods=['POST'])
+@login_required
+def api_group_delete():
+    data = request.get_json(silent=True) or {}
+    with get_db() as db:
+        try:
+            group = group_for_user(db, session['user_id'], data.get('id'))
+        except ValueError as exc:
+            return jsonify_error(str(exc), 404)
+        db.execute('''UPDATE site_preferences SET group_id = NULL
+            WHERE group_id = ? AND source_id IN (SELECT id FROM sources WHERE user_id = ?)''',
+            (group['id'], session['user_id']))
+        db.execute('DELETE FROM site_groups WHERE id = ?', (group['id'],))
+        db.execute('DELETE FROM group_suggestions WHERE user_id = ?', (session['user_id'],))
+    return jsonify_success('分组已删除，站点已移至未分类')
+
+
+@app.route('/api/group/assign', methods=['POST'])
+@login_required
+def api_group_assign():
+    data = request.get_json(silent=True) or {}
+    with get_db() as db:
+        try:
+            group = group_for_user(db, session['user_id'], data.get('group_id'))
+            refs = owned_site_refs(db, session['user_id'], data.get('sites'))
+        except (ValueError, requests.RequestException, UnicodeError) as exc:
+            return jsonify_error(str(exc), 400)
+        group_id = group['id'] if group else None
+        for source_id, key in refs:
+            db.execute('''INSERT INTO site_preferences (source_id, site_key, group_id)
+                VALUES (?, ?, ?) ON CONFLICT(source_id, site_key)
+                DO UPDATE SET group_id = excluded.group_id''', (source_id, key, group_id))
+            db.execute('''DELETE FROM group_suggestions WHERE user_id = ? AND source_id = ? AND site_key = ?''',
+                       (session['user_id'], source_id, key))
+    return jsonify_success(f'已移动 {len(refs)} 个站点', count=len(refs))
+
+
+@app.route('/api/model/settings', methods=['GET', 'POST'])
+@login_required
+def api_model_settings():
+    user_id = session['user_id']
+    if request.method == 'GET':
+        with get_db() as db:
+            row = db.execute('SELECT provider, model FROM model_settings WHERE user_id = ?',
+                             (user_id,)).fetchone()
+        return jsonify_success(data={'configured': bool(row),
+                                     'provider': row['provider'] if row else 'openrouter',
+                                     'model': row['model'] if row else PROVIDERS['openrouter'][1]})
+    data = request.get_json(silent=True) or {}
+    provider = data.get('provider')
+    if provider not in PROVIDERS:
+        return jsonify_error('不支持的模型服务', 400)
+    model = str(data.get('model') or '').strip()[:80] or PROVIDERS[provider][1]
+    key = str(data.get('api_key') or '').strip()
+    with get_db() as db:
+        existing = db.execute('SELECT provider, encrypted_key FROM model_settings WHERE user_id = ?',
+                              (user_id,)).fetchone()
+        if not key and not existing:
+            return jsonify_error('请输入 API Key', 400)
+        if not key and existing['provider'] != provider:
+            return jsonify_error('切换模型服务时需要输入对应服务的 API Key', 400)
+        encrypted = fernet_for_secret(app.secret_key).encrypt(key.encode()).decode() if key else existing['encrypted_key']
+        db.execute('''INSERT INTO model_settings (user_id, provider, model, encrypted_key)
+            VALUES (?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET
+            provider = excluded.provider, model = excluded.model,
+            encrypted_key = excluded.encrypted_key''', (user_id, provider, model, encrypted))
+    return jsonify_success('模型接入设置已保存')
+
+
+@app.route('/api/group/suggestions')
+@login_required
+def api_group_suggestions():
+    raw = request.args.get('group_id', 'unclassified')
+    try:
+        group_id = None if raw == 'unclassified' else int(raw)
+    except ValueError:
+        return jsonify_error('分组参数错误', 400)
+    with get_db() as db:
+        try:
+            group_for_user(db, session['user_id'], group_id)
+        except ValueError as exc:
+            return jsonify_error(str(exc), 404)
+        rows = db.execute('''SELECT g.* FROM group_suggestions g
+            JOIN sources s ON s.id = g.source_id
+            LEFT JOIN site_preferences p ON p.source_id = g.source_id AND p.site_key = g.site_key
+            WHERE g.user_id = ? AND s.user_id = ?
+              AND g.context_group_id IS ? AND p.group_id IS ?
+            ORDER BY g.created_at DESC, g.source_id, g.site_key''',
+            (session['user_id'], session['user_id'], group_id, group_id)).fetchall()
+    return jsonify_success(data=[{**dict(row), 'probabilities': json.loads(row['probabilities'])}
+                                 for row in rows])
+
+
+@app.route('/api/group/analyze', methods=['POST'])
+@login_required
+def api_group_analyze():
+    data = request.get_json(silent=True) or {}
+    group_id = data.get('group_id')
+    with get_db() as db:
+        ensure_groups_bootstrapped(db, session['user_id'])
+        try:
+            group_for_user(db, session['user_id'], group_id)
+            refs = owned_site_refs(db, session['user_id'], data.get('sites'))
+        except (ValueError, requests.RequestException, UnicodeError) as exc:
+            return jsonify_error(str(exc), 400)
+        if len(refs) > 25:
+            return jsonify_error('每批最多分析 25 个站点', 400)
+        settings = db.execute('SELECT * FROM model_settings WHERE user_id = ?',
+                              (session['user_id'],)).fetchone()
+        if not settings:
+            return jsonify_error('请先配置 Jev API Key', 400)
+        try:
+            api_key = fernet_for_secret(app.secret_key).decrypt(settings['encrypted_key'].encode()).decode()
+        except Exception:
+            return jsonify_error('模型密钥无法解密，请重新保存 API Key', 500)
+        groups = [dict(row) for row in db.execute('''SELECT id, name, description
+            FROM site_groups WHERE user_id = ? ORDER BY order_index, id''', (session['user_id'],))]
+        source_map = {row['id']: row for row in db.execute(
+            "SELECT * FROM sources WHERE user_id = ? AND type = 'site'", (session['user_id'],))}
+        config_maps = {}
+        config_bodies = {}
+        selected = []
+        for source_id, key in refs:
+            current = db.execute('SELECT group_id FROM site_preferences WHERE source_id = ? AND site_key = ?',
+                                 (source_id, key)).fetchone()
+            if (current['group_id'] if current else None) != group_id:
+                return jsonify_error('站点已不在当前分组，请刷新列表', 409)
+            if source_id not in config_maps:
+                config_maps[source_id] = {site_key(site): site for site in cached_config(db, source_map[source_id])['sites']
+                                          if isinstance(site, dict)}
+                config_bodies[source_id] = db.execute(
+                    'SELECT body FROM source_configs WHERE source_id = ?', (source_id,)).fetchone()['body']
+            site = config_maps[source_id][key]
+            selected.append((source_id, key, {
+                'name': site.get('name') or key, 'key': key, 'type': site.get('type'),
+                'source_name': source_map[source_id]['name']}))
+        provider, model = settings['provider'], settings['model']
+    def classify(item):
+        source_id, key, site = item
+        try:
+            result = classify_with_jev(site, groups, group_id, provider, model, api_key)
+            return (source_id, key, result, None)
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            return (source_id, key, None, str(exc)[:160])
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        outcomes = list(executor.map(classify, selected))
+    results, errors = [], []
+    with get_db() as db:
+        for source_id, key, result, error in outcomes:
+            if error:
+                errors.append({'source_id': source_id, 'key': key, 'message': error})
+                continue
+            current = db.execute('''SELECT p.group_id FROM site_preferences p
+                JOIN sources s ON s.id = p.source_id
+                WHERE p.source_id = ? AND p.site_key = ? AND s.user_id = ?''',
+                (source_id, key, session['user_id'])).fetchone()
+            if (current['group_id'] if current else None) != group_id:
+                errors.append({'source_id': source_id, 'key': key, 'message': '站点已移组，建议未保存'})
+                continue
+            if not source_for_user(db, source_id, session['user_id']):
+                errors.append({'source_id': source_id, 'key': key, 'message': '配置来源已移除'})
+                continue
+            latest_config = db.execute('SELECT body FROM source_configs WHERE source_id = ?',
+                                       (source_id,)).fetchone()
+            if not latest_config or latest_config['body'] != config_bodies[source_id]:
+                errors.append({'source_id': source_id, 'key': key, 'message': '原配置已更新，建议未保存'})
+                continue
+            db.execute('''INSERT INTO group_suggestions
+                (user_id, source_id, site_key, context_group_id, suggested_group_id,
+                 confidence, membership, probabilities, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, source_id, site_key) DO UPDATE SET
+                context_group_id = excluded.context_group_id,
+                suggested_group_id = excluded.suggested_group_id,
+                confidence = excluded.confidence, membership = excluded.membership,
+                probabilities = excluded.probabilities, created_at = excluded.created_at''',
+                (session['user_id'], source_id, key, group_id, result['suggested_group_id'],
+                 result['confidence'], result['membership'],
+                 json.dumps(result['probabilities']), utc_now()))
+            results.append({'source_id': source_id, 'key': key, **result})
+    return jsonify_success(data=results, errors=errors)
+
+
 @app.route('/api/site/probe', methods=['POST'])
 @login_required
 def api_site_probe():
@@ -614,6 +959,10 @@ def api_admin_users():
 def api_admin_users_delete():
     uid = request.json.get('id')
     with get_db() as db:
+        db.execute('DELETE FROM group_suggestions WHERE user_id = ?', (uid,))
+        db.execute('DELETE FROM model_settings WHERE user_id = ?', (uid,))
+        db.execute('DELETE FROM group_bootstrap WHERE user_id = ?', (uid,))
+        db.execute('DELETE FROM site_groups WHERE user_id = ?', (uid,))
         db.execute('''DELETE FROM source_configs WHERE source_id IN
             (SELECT id FROM sources WHERE user_id = ?)''', (uid,))
         db.execute('''DELETE FROM site_preferences WHERE source_id IN

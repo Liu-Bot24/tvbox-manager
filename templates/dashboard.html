@@ -1,11 +1,56 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>站点管理 · TVBox Manager</title><link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}"><script src="{{ url_for('static', filename='dashboard.js') }}" defer></script></head>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>站点管理 · TVBox Manager</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</head>
 <body data-sub-url="{{ sub_url }}">
-<header class="topbar"><div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>TVBox <strong>Manager</strong></div><nav class="top-actions" aria-label="账户"><span>{{ username }}</span>{% if is_admin %}<a href="/admin">系统管理</a>{% endif %}<a href="{{ url_for('api_logout') }}">退出</a></nav></header>
+<header class="topbar">
+  <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>TVBox <strong>Manager</strong></div>
+  <nav class="top-actions" aria-label="账户"><span>{{ username }}</span>{% if is_admin %}<a href="/admin">系统管理</a>{% endif %}<a href="{{ url_for('api_logout') }}">退出</a></nav>
+</header>
 <main class="workspace">
-<div class="page-heading"><div><p class="eyebrow">聚合配置 / 站点控制</p><h1>所有站点，一处管理</h1><p class="intro">导入多份配置后，逐个探测和勾选站点；电视始终使用同一份整合配置。</p></div><button class="button button-quiet" id="reloadSites" type="button">刷新列表</button></div>
-<section class="subscription"><div><p class="eyebrow">电视端使用</p><h2>整合订阅地址</h2><p>已启用的站点会自动写入这份配置。</p></div><div class="subscription-link"><code id="subLink">{{ sub_url }}</code><button class="button button-primary" id="copyLink" type="button">复制地址</button><button class="button button-outline" id="previewButton" type="button">预览 JSON</button></div></section>
-<section class="summary" aria-label="站点统计"><div class="stat"><span>站点总数</span><strong id="totalCount">—</strong></div><div class="stat"><span>已启用</span><strong id="enabledCount">—</strong></div><div class="stat"><span>探测可用</span><strong id="onlineCount">—</strong></div><div class="stat"><span>配置来源</span><strong id="sourceCount">—</strong></div></section>
-<section class="panel"><div class="section-heading"><div><p class="eyebrow">站点列表</p><h2>逐站点选择</h2></div><p id="probeProgress" class="muted" role="status" aria-live="polite">勾选即生效</p></div><div class="toolbar"><label class="search-wrap"><span class="sr-only">搜索站点或来源</span><input id="siteSearch" type="search" placeholder="搜索站点名称、来源或 Key"></label><select id="statusFilter" aria-label="按状态筛选"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="online">探测可用</option><option value="failed">探测失败</option><option value="unprobed">未探测</option></select><select id="sortSites" aria-label="排序"><option value="source">按来源顺序</option><option value="latency">按响应延迟</option><option value="name">按站点名称</option></select><input id="probeKeyword" value="庆余年" maxlength="40" aria-label="探测搜索词" title="CMS 站点搜索词"><button class="button button-primary" id="probeVisible" type="button">探测当前列表</button></div><p class="hint">CMS 测搜索与详情；直连 HLS 可测播放首段。Spider 可测独立脚本或接口的响应延迟，但搜索和播放仍需电视端验证。</p><div id="siteErrors" class="notice" hidden></div><div class="table-scroll"><table><thead><tr><th>启用</th><th>站点 / 来源</th><th>类型</th><th>探测结果</th><th class="numeric">搜索</th><th class="numeric">详情</th><th class="numeric">播放首段</th><th class="numeric">速度</th><th>操作</th></tr></thead><tbody id="siteRows"><tr><td colspan="9" class="empty">正在读取站点…</td></tr></tbody></table></div><div class="table-footer"><span id="shownCount">—</span><span>延迟单位：毫秒；— 表示未测得</span></div></section>
-<section class="panel"><div class="section-heading"><div><p class="eyebrow">配置来源</p><h2>导入与维护</h2></div><button class="button button-quiet" id="refreshAllSources" type="button">刷新原始配置</button></div><p class="hint">导入地址中的所有站点都会出现在上方列表。启用状态只由每个站点的勾选决定。</p><form id="sourceForm" class="source-form"><input type="hidden" id="sourceId"><label>名称<input id="sourceName" required placeholder="例如：饭太硬"></label><label>配置 URL<input id="sourceUrl" type="url" required placeholder="https://…/config.json"></label><label>类型<select id="sourceType"><option value="site">TVBox 配置</option><option value="live">直播地址</option></select></label><button class="button button-primary" id="saveSource" type="submit">添加配置</button><button class="button button-quiet" id="cancelEdit" type="button" hidden>取消</button></form><div id="sourceRows" class="source-list"><p class="empty">正在读取来源…</p></div></section>
-</main><dialog id="previewDialog" class="preview-dialog"><div class="dialog-head"><h2>整合配置预览</h2><button class="button button-quiet" id="closePreview" type="button">关闭</button></div><pre id="jsonPreview">正在生成…</pre></dialog><div id="toast" class="toast" role="status" aria-live="polite"></div></body></html>
+  <div class="page-heading"><div><p class="eyebrow">聚合配置 / 站点控制</p><h1>所有站点，一处管理</h1><p class="intro">按分组、状态和类型快速处理站点；电视始终使用同一份整合配置。</p></div><button class="button button-quiet" id="reloadSites" type="button">刷新列表</button></div>
+  <section class="subscription"><div><p class="eyebrow">电视端使用</p><h2>整合订阅地址</h2><p>已启用的站点会自动写入这份配置。</p></div><div class="subscription-link"><code id="subLink">{{ sub_url }}</code><button class="button button-primary" id="copyLink" type="button">复制地址</button><button class="button button-outline" id="previewButton" type="button">预览 JSON</button></div></section>
+  <section class="summary" aria-label="站点统计"><div class="stat"><span>站点总数</span><strong id="totalCount">—</strong></div><div class="stat"><span>已启用</span><strong id="enabledCount">—</strong></div><div class="stat"><span>搜索可用</span><strong id="onlineCount">—</strong></div><div class="stat"><span>配置来源</span><strong id="sourceCount">—</strong></div></section>
+
+  <div class="management-layout">
+    <aside class="panel group-sidebar" aria-labelledby="groupsTitle">
+      <div class="section-heading"><div><p class="eyebrow">分类管理</p><h2 id="groupsTitle">分组</h2></div></div>
+      <p class="hint">点击查看；把右侧站点拖到分组上即可移动。</p>
+      <nav id="groupNav" class="group-nav" aria-label="站点分组"></nav>
+      <form id="newGroupForm" class="new-group-form"><label>新建分组<input id="newGroupName" required maxlength="40" placeholder="如：纪录片"></label><label>用途说明<input id="newGroupDescription" maxlength="240" placeholder="给模型判断时参考"></label><button class="button button-quiet" type="submit">添加分组</button></form>
+    </aside>
+
+    <div class="management-main">
+      <section class="panel sites-panel">
+        <div class="section-heading"><div><p class="eyebrow">站点列表</p><h2 id="currentGroupTitle">全部站点</h2></div><p id="probeProgress" class="muted" role="status" aria-live="polite">勾选即生效</p></div>
+        <div class="bulk-bar"><label class="bulk-label">快速操作<select id="batchAction" aria-label="选择批量操作">
+          <option value="">选择操作…</option>
+          <optgroup label="全部站点"><option value="disable_failed">停用探测失败</option><option value="disable_unsupported">停用需电视端验证</option><option value="enable_cms">启用全部 CMS</option><option value="disable_cms">停用全部 CMS</option><option value="enable_spider">启用全部 Spider</option><option value="disable_spider">停用全部 Spider</option></optgroup>
+          <optgroup label="当前分组"><option value="enable_group">启用当前分组</option><option value="disable_group">停用当前分组</option><option value="enable_visible">启用当前筛选</option><option value="disable_visible">停用当前筛选</option></optgroup>
+        </select></label><span id="batchPreview" class="muted">选择操作后显示影响数量</span><button class="button button-primary" id="applyBatch" type="button" disabled>执行操作</button></div>
+        <div class="toolbar"><label class="search-wrap"><span class="sr-only">搜索站点或来源</span><input id="siteSearch" type="search" placeholder="搜索站点名称、来源或 Key"></label><select id="statusFilter" aria-label="按状态筛选"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="online">搜索可用</option><option value="resource">资源可达</option><option value="failed">探测失败</option><option value="unsupported">需电视端验证</option><option value="unprobed">未探测</option></select><select id="sortSites" aria-label="排序"><option value="source">按来源顺序</option><option value="latency">按响应延迟</option><option value="name">按站点名称</option></select><input id="probeKeyword" value="庆余年" maxlength="40" aria-label="探测搜索词" title="CMS 站点搜索词"><button class="button button-primary" id="probeVisible" type="button">探测当前列表</button></div>
+        <p class="hint">CMS 测搜索与详情；Spider 只测独立脚本或接口的响应延迟。资源可达并不代表电视端搜索或播放可用。</p>
+        <div id="siteErrors" class="notice" hidden></div>
+        <div class="table-scroll"><table><thead><tr><th>启用</th><th>站点 / 来源</th><th>分组</th><th>类型</th><th>探测结果</th><th class="numeric">搜索</th><th class="numeric">详情</th><th class="numeric">播放首段</th><th class="numeric">速度</th><th>操作</th></tr></thead><tbody id="siteRows"><tr><td colspan="10" class="empty">正在读取站点…</td></tr></tbody></table></div><div class="table-footer"><span id="shownCount">—</span><span>延迟单位：毫秒；— 表示未测得</span></div>
+      </section>
+
+      <section class="panel ai-panel" id="aiPanel" aria-labelledby="aiTitle">
+        <div class="section-heading"><div><p class="eyebrow">Jev 分类建议</p><h2 id="aiTitle">当前分组审核</h2></div><span id="modelStatus" class="muted">未接入模型</span></div>
+        <p class="hint">模型只给建议。你可以按置信度预选、取消误判；确认后才会移动站点。分析时仅发送站点名称、Key、来源、类型和分组说明。</p>
+        <div class="ai-controls"><label>置信度基线 <strong id="thresholdLabel">70%</strong><input id="confidenceThreshold" type="range" min="0" max="100" value="70"></label><button class="button button-primary" id="analyzeGroup" type="button">分析当前分组</button><span id="analysisProgress" class="muted" role="status" aria-live="polite"></span></div>
+        <div id="suggestionRows" class="suggestions"><p class="empty">选择分组并接入 Jev 后，可在这里审核分类建议。</p></div>
+        <details class="model-settings" id="modelSettings"><summary>模型接入设置</summary><form id="modelForm"><label>服务<select id="modelProvider"><option value="openrouter">OpenRouter（推荐）</option><option value="typesafe">TypeSafe 官方</option></select></label><label>模型名称<input id="modelName" value="typesafe/jev-1.13" required></label><label>API Key<input id="modelKey" type="password" autocomplete="new-password" placeholder="已保存的 Key 不会显示"></label><button class="button button-quiet" type="submit">保存接入设置</button></form><p class="hint">API Key 在服务端加密保存；修改服务时需要输入对应的新 Key。</p></details>
+      </section>
+    </div>
+  </div>
+
+  <section class="panel"><div class="section-heading"><div><p class="eyebrow">配置来源</p><h2>导入与维护</h2></div><button class="button button-quiet" id="refreshAllSources" type="button">刷新原始配置</button></div><p class="hint">新导入站点先进入“未分类”；刷新原配置会保留已有分组和启用选择。</p><form id="sourceForm" class="source-form"><input type="hidden" id="sourceId"><label>名称<input id="sourceName" required placeholder="例如：饭太硬"></label><label>配置 URL<input id="sourceUrl" type="url" required placeholder="https://…/config.json"></label><label>类型<select id="sourceType"><option value="site">TVBox 配置</option><option value="live">直播地址</option></select></label><button class="button button-primary" id="saveSource" type="submit">添加配置</button><button class="button button-quiet" id="cancelEdit" type="button" hidden>取消</button></form><div id="sourceRows" class="source-list"><p class="empty">正在读取来源…</p></div></section>
+</main>
+<dialog id="previewDialog" class="preview-dialog"><div class="dialog-head"><h2>整合配置预览</h2><button class="button button-quiet" id="closePreview" type="button">关闭</button></div><pre id="jsonPreview">正在生成…</pre></dialog>
+<dialog id="groupDialog" class="group-dialog"><form id="editGroupForm"><h2>编辑分组</h2><input type="hidden" id="editGroupId"><label>名称<input id="editGroupName" required maxlength="40"></label><label>用途说明<input id="editGroupDescription" maxlength="240"></label><div class="dialog-actions"><button class="button button-quiet danger" id="deleteGroup" type="button">删除分组</button><button class="button button-quiet" id="cancelGroupEdit" type="button">取消</button><button class="button button-primary" type="submit">保存</button></div></form></dialog>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body></html>
