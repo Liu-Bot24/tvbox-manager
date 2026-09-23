@@ -6,7 +6,7 @@ import concurrent.futures
 import requests
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from functools import wraps
 from contextlib import contextmanager
 from flask import Flask, request, session, redirect, url_for, render_template, jsonify, Response
@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 # --- Configuration & Constants ---
 APP_VERSION = "v1.0.41"
 app.secret_key = os.environ.get('SECRET_KEY', 'super-secret-starlink-clone-key')
+app.permanent_session_lifetime = timedelta(days=30)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax')
 DATABASE = os.environ.get('DB_PATH', '/app/data/database.db')
 REG_CODE = os.environ.get('REG_CODE', '888888')
 BASE_URL = os.environ.get('BASE_URL', '').rstrip('/')
@@ -270,6 +272,7 @@ def api_login():
         
     if user and check_password_hash(user['password_hash'], password):
         session.update({'user_id': user['id'], 'username': user['username'], 'is_admin': user['is_admin'] == 1})
+        session.permanent = bool(data.get('remember', False))
         return jsonify_success('登录成功')
     return jsonify_error('用户名或密码错误')
 
@@ -285,6 +288,39 @@ def api_source_list():
     with get_db() as db:
         sources = db.execute('SELECT * FROM sources WHERE user_id = ? ORDER BY order_index ASC, id ASC', (session['user_id'],)).fetchall()
         return jsonify_success(data=[dict(row) for row in sources])
+
+
+@app.route('/api/site/list')
+@login_required
+def api_all_sites():
+    with get_db() as db:
+        sources = db.execute('''SELECT * FROM sources WHERE user_id = ? AND type = 'site'
+            ORDER BY order_index ASC, id ASC''', (session['user_id'],)).fetchall()
+        preferences = {}
+        for row in db.execute('''SELECT p.* FROM site_preferences p
+            JOIN sources s ON s.id = p.source_id WHERE s.user_id = ?''', (session['user_id'],)):
+            preferences[(row['source_id'], row['site_key'])] = dict(row)
+        rows = []
+        errors = []
+        for source in sources:
+            try:
+                config = cached_config(db, source)
+            except (requests.RequestException, ValueError, UnicodeError) as exc:
+                errors.append({'source': source['name'], 'message': str(exc)[:160]})
+                continue
+            for site in config['sites']:
+                if not isinstance(site, dict) or not site_key(site): continue
+                key = site_key(site)
+                pref = preferences.get((source['id'], key), {})
+                rows.append({
+                    'source_id': source['id'], 'source_name': source['name'],
+                    'key': key, 'name': site.get('name') or key,
+                    'type': site.get('type'), 'api': site.get('api', ''),
+                    'enabled': bool(pref.get('enabled', 1)),
+                    'result': json.loads(pref['result']) if pref.get('result') else None,
+                    'checked_at': pref.get('checked_at'),
+                })
+        return jsonify_success(data=rows, errors=errors)
 
 @app.route('/api/source/add', methods=['POST'])
 @login_required
@@ -620,7 +656,7 @@ def get_tvbox_json(username):
         user = db.execute('SELECT id FROM users WHERE username = ?', (username,)).fetchone()
         if not user: return jsonify_error('用户不存在', 404)
             
-        sql = 'SELECT * FROM sources WHERE user_id = ? AND enabled = 1 ORDER BY order_index ASC, id ASC'
+        sql = 'SELECT * FROM sources WHERE user_id = ? ORDER BY order_index ASC, id ASC'
         sources = db.execute(sql, (user['id'],)).fetchall()
         inputs = []
         direct_lives = []

@@ -5,6 +5,19 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>影视仓接口中心 - 登录</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+      body { background:#f3f6f8; color:#192d40; font-family:Inter,'PingFang SC','Microsoft YaHei',sans-serif; }
+      .glass-panel { background:#fff; border:1px solid #dce5ec; box-shadow:0 16px 50px #192d4014; border-radius:12px; }
+      .auth-box h2 { text-align:left; font-size:24px; letter-spacing:-.04em; margin-bottom:26px; }
+      .form-group label { color:#607386; }
+      .form-control { background:#fff; color:#192d40; border:1px solid #cbd8e2; }
+      .form-control:focus { border-color:#087e78; box-shadow:0 0 0 3px #087e7824; }
+      .btn-primary { background:#087e78; box-shadow:none; }
+      .btn-primary:hover { background:#066963; transform:none; }
+      .remember-row { display:flex; align-items:center; gap:9px; color:#405568; font-size:13px; cursor:pointer; }
+      .remember-row input { width:16px; height:16px; accent-color:#087e78; }
+      a { color:#087e78; }
+    </style>
 </head>
 <body>
     <div class="auth-wrapper">
@@ -19,6 +32,7 @@
                     <label>密码</label>
                     <input type="password" id="password" class="form-control" placeholder="输入密码" required>
                 </div>
+                <label class="remember-row"><input type="checkbox" id="remember" checked>30 天内保持登录</label>
                 <div id="errorMsg" class="error-msg"></div>
                 <button type="submit" class="btn btn-primary mt-4">进入控制台</button>
             </form>
@@ -41,7 +55,8 @@
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     username: document.getElementById('username').value,
-                    password: document.getElementById('password').value
+                    password: document.getElementById('password').value,
+                    remember: document.getElementById('remember').checked
                 })
             });
             const data = await res.json();

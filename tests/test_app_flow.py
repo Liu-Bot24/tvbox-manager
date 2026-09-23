@@ -43,17 +43,49 @@ class AppFlowTests(unittest.TestCase):
         with patch.object(self.module, 'load_config', side_effect=load):
             self.assertEqual(self.client.get('/api/source/1/sites').status_code, 200)
             self.assertEqual(self.client.get('/api/source/2/sites').status_code, 200)
+        aggregate = self.client.get('/api/site/list').json['data']
+        self.assertEqual([(site['source_name'], site['key']) for site in aggregate],
+                         [('甲', 'a'), ('甲', 'same'), ('乙', 'same')])
         self.assertEqual(self.client.post('/api/site/enable', json={
             'source_id': 1, 'key': 'a', 'enabled': False}).json['status'], 'success')
         merged = self.client.get('/api/subscribe/tester.json').json
         self.assertEqual([site['key'] for site in merged['sites']], ['same', '2_same'])
         self.assertEqual([site['jar'] for site in merged['sites']],
                          ['https://example.org/a.jar', 'https://example.org/b.jar'])
+        self.assertFalse(next(site for site in self.client.get('/api/site/list').json['data']
+                              if site['key'] == 'a')['enabled'])
+
+    def test_source_switch_does_not_override_individual_sites(self):
+        with patch.object(self.module, 'load_config', return_value=(
+                {'sites': [{'key': 'one', 'name': 'One', 'type': 1,
+                            'api': 'https://example.org/api'}]}, 10)):
+            self.client.get('/api/source/1/sites')
+        self.client.post('/api/source/enable', json={'id': 1, 'enabled': False})
+        self.client.post('/api/source/delete', json={'id': 2})
+        self.assertEqual([site['key'] for site in self.client.get('/api/subscribe/tester.json').json['sites']],
+                         ['one'])
+        self.client.post('/api/site/enable', json={'source_id': 1, 'key': 'one', 'enabled': False})
+        self.assertEqual(self.client.get('/api/subscribe/tester.json').json['sites'], [])
 
     def test_other_user_cannot_toggle_site(self):
         response = self.client.post('/api/site/enable', json={
             'source_id': 999, 'key': 'a', 'enabled': False})
         self.assertEqual(response.status_code, 404)
+
+    def test_remember_login_uses_persistent_cookie_only_when_checked(self):
+        from werkzeug.security import generate_password_hash
+        with self.module.get_db() as db:
+            db.execute('UPDATE users SET password_hash = ? WHERE id = 1',
+                       (generate_password_hash('example-password'),))
+        fresh = self.module.app.test_client()
+        remembered = fresh.post('/api/auth/login', json={
+            'username': 'tester', 'password': 'example-password', 'remember': True})
+        self.assertEqual(remembered.json['status'], 'success')
+        self.assertIn('Expires=', remembered.headers['Set-Cookie'])
+        fresh.get('/api/auth/logout')
+        temporary = fresh.post('/api/auth/login', json={
+            'username': 'tester', 'password': 'example-password', 'remember': False})
+        self.assertNotIn('Expires=', temporary.headers['Set-Cookie'])
 
     def test_probe_result_is_listed_and_filters_merged_config(self):
         config = {'sites': [{'key': 'a', 'name': 'A', 'type': 1,
@@ -67,9 +99,8 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(response.json['data']['search_ms'], 12)
         listed = self.client.get('/api/source/1/sites').json['data']
         self.assertEqual(listed[0]['result']['status'], 'online')
-        # The second source remains uncached; disable it so the filtered request
-        # exercises the selected first source only.
-        self.client.post('/api/source/enable', json={'id': 2, 'enabled': False})
+        # The second source remains uncached; remove it for this isolated probe test.
+        self.client.post('/api/source/delete', json={'id': 2})
         output = self.client.get('/api/subscribe/tester.json?only_online=true').json
         self.assertEqual([site['key'] for site in output['sites']], ['a'])
         self.assertEqual(self.client.get('/dashboard').status_code, 200)
