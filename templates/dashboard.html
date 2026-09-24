@@ -27,6 +27,7 @@
     <div class="management-main">
       <section class="panel sites-panel">
         <div class="section-heading"><div><p class="eyebrow">站点列表</p><h2 id="currentGroupTitle">全部站点</h2></div><p id="probeProgress" class="muted" role="status" aria-live="polite">勾选即生效</p></div>
+        <div class="selection-bar" aria-label="当前范围的站点启用状态"><div class="selection-copy"><strong id="selectionScope">全部站点</strong><span id="selectionSummary">正在读取站点…</span></div><div class="selection-actions"><button class="button button-primary" id="selectAllEnable" type="button" disabled>全选启用</button><button class="button button-outline" id="selectAllDisable" type="button" disabled>全选停用</button></div></div>
         <div class="bulk-bar"><label class="bulk-label">快速操作<select id="batchAction" aria-label="选择批量操作">
           <option value="">选择操作…</option>
           <optgroup label="全部站点"><option value="disable_failed">停用探测失败</option><option value="disable_unsupported">停用需电视端验证</option><option value="enable_cms">启用全部 CMS</option><option value="disable_cms">停用全部 CMS</option><option value="enable_spider">启用全部 Spider</option><option value="disable_spider">停用全部 Spider</option></optgroup>

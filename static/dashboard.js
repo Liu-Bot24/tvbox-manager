@@ -1,7 +1,7 @@
 const $ = id => document.getElementById(id);
 const subUrl = document.body.dataset.subUrl;
 let sites = [], sources = [], groups = [], suggestions = [];
-let currentGroup = 'all', modelConfigured = false, busyProbing = false, draggedSite = null;
+let currentGroup = 'all', modelConfigured = false, busyProbing = false, busyBatch = false, draggedSite = null;
 
 function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function ref(site) { return {source_id:site.source_id, key:site.key}; }
@@ -57,7 +57,7 @@ function renderSites() {
     const title = result.error ? `${status} · ${result.error}` : status;
     return `<tr draggable="true" data-id="${esc(rowId(site))}"><td><input class="site-toggle" type="checkbox" aria-label="启用 ${esc(site.name)}" ${site.enabled ? 'checked' : ''}></td><td><span class="site-title" title="${esc(site.name)}">${esc(site.name)}</span><span class="site-subtitle" title="${esc(site.source_name)} · ${esc(site.key)}">${esc(site.source_name)} · ${esc(site.key)}</span></td><td><select class="row-group-select" aria-label="${esc(site.name)}所属分组">${groupOptions(groupValue(site))}</select></td><td><span class="type-badge">${esc(type)}</span></td><td><span class="status ${state}" title="${esc(title)}">${esc(status)}</span></td><td class="numeric">${metric(result.search_ms)}</td><td class="numeric">${metric(result.detail_ms)}</td><td class="numeric">${metric(result.play_latency_ms)}</td><td class="numeric">${metric(result.speed_kbps,' kbps')}</td><td><button class="row-action" type="button">探测</button></td></tr>`;
   }).join('') : '<tr><td colspan="10" class="empty">没有符合条件的站点。请调整筛选或导入配置。</td></tr>';
-  renderGroups(); renderBatchPreview();
+  renderGroups(); renderSelectionControls(); renderBatchPreview();
 }
 async function loadGroups() { groups = (await api('/api/group/list')).data; renderGroups(); }
 async function loadSites() {
@@ -92,19 +92,36 @@ function batchTargets(action) {
   if (action === 'disable_visible') return visibleSites().filter(s => s.enabled);
   return [];
 }
+function selectionScope() { return currentGroup === 'all' ? '全部站点' : `「${$('currentGroupTitle').textContent}」分组`; }
+function renderSelectionControls() {
+  const scoped = sites.filter(inCurrentGroup), enabled = scoped.filter(site => site.enabled).length;
+  $('selectionScope').textContent = selectionScope();
+  $('selectionSummary').textContent = `共 ${scoped.length} 个 · 已启用 ${enabled} 个`;
+  $('selectAllEnable').disabled = busyBatch || scoped.length === 0;
+  $('selectAllDisable').disabled = busyBatch || scoped.length === 0;
+}
 function renderBatchPreview() {
   const action = $('batchAction').value, count = batchTargets(action).length;
   const scope = action.endsWith('_group') ? (currentGroup === 'all' ? '全部站点' : `「${$('currentGroupTitle').textContent}」分组`)
     : action.endsWith('_visible') ? '当前筛选结果' : '全部站点';
   $('batchPreview').textContent = action ? `${scope}：将影响 ${count} 个站点` : '选择操作后显示影响数量';
-  $('applyBatch').disabled = !count;
+  $('applyBatch').disabled = busyBatch || !count;
+}
+async function setSitesEnabled(targets, enabled, description) {
+  if (busyBatch) return;
+  if (!targets.length) { toast(`当前范围已全部${enabled ? '启用' : '停用'}`); return; }
+  if (!confirm(`${description}：将 ${targets.length} 个站点设为${enabled ? '启用' : '停用'}，确定执行？`)) return;
+  busyBatch = true; renderSelectionControls(); renderBatchPreview();
+  try {
+    const data = await api('/api/site/batch_enable', {enabled, sites:targets.map(ref)});
+    for (const site of targets) site.enabled = enabled;
+    toast(data.message);
+  } catch (error) { toast(error.message); }
+  finally { busyBatch = false; renderSites(); }
 }
 async function applyBatch() {
   const action = $('batchAction').value, targets = batchTargets(action), label = $('batchAction').selectedOptions[0].textContent;
-  if (!targets.length || !confirm(`${label}：将更新 ${targets.length} 个站点，确定执行？`)) return;
-  const enabled = action.startsWith('enable_'), button = $('applyBatch'); button.disabled = true;
-  try { const data = await api('/api/site/batch_enable', {enabled,sites:targets.map(ref)}); for (const site of targets) site.enabled = enabled; renderSites(); toast(data.message); }
-  catch (error) { toast(error.message); renderBatchPreview(); }
+  await setSitesEnabled(targets, action.startsWith('enable_'), label);
 }
 async function probeOne(site, button) {
   if (button) { button.disabled = true; button.textContent = '探测中…'; }
@@ -197,6 +214,8 @@ $('statusFilter').addEventListener('change', renderSites);
 $('sortSites').addEventListener('change', renderSites);
 $('batchAction').addEventListener('change', renderBatchPreview);
 $('applyBatch').addEventListener('click', applyBatch);
+$('selectAllEnable').addEventListener('click', () => setSitesEnabled(batchTargets('enable_group'), true, `${selectionScope()}全选启用`));
+$('selectAllDisable').addEventListener('click', () => setSitesEnabled(batchTargets('disable_group'), false, `${selectionScope()}全选停用`));
 $('reloadSites').addEventListener('click', async () => { await loadGroups(); await loadSites(); await loadSuggestions(); });
 $('probeVisible').addEventListener('click', probeVisible);
 $('groupNav').addEventListener('click', async event => {
