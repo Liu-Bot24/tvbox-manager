@@ -49,6 +49,16 @@ def merge_configs(inputs, preferences=None, online_only=False):
             original_key = str(site.get('key') or '').strip()
             if not original_key:
                 continue
+            # Reserve names for every imported site before filtering enabled ones.
+            # Toggling a colliding site must not rename another site's public key.
+            key = original_key
+            if key in used_keys:
+                key = f'{source_id}_{original_key}'
+                suffix = 2
+                while key in used_keys:
+                    key = f'{source_id}_{original_key}_{suffix}'
+                    suffix += 1
+            used_keys.add(key)
             pref = preferences.get((source_id, original_key), {})
             if not pref.get('enabled', True):
                 continue
@@ -57,15 +67,7 @@ def merge_configs(inputs, preferences=None, online_only=False):
             copy = deepcopy(site)
             if copy.get('type') == 3 and str(copy.get('api', '')).startswith('csp_') and spider and not copy.get('jar'):
                 copy['jar'] = spider
-            key = original_key
-            if key in used_keys:
-                key = f'{source_id}_{original_key}'
-                suffix = 2
-                while key in used_keys:
-                    key = f'{source_id}_{original_key}_{suffix}'
-                    suffix += 1
-                copy['key'] = key
-            used_keys.add(key)
+            copy['key'] = key
             result['sites'].append(copy)
         for field, seen in (('parses', seen_parses), ('lives', seen_lives)):
             for item in config.get(field) or []:

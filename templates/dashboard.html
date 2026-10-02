@@ -1,57 +1,134 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>站点管理 · TVBox Manager</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
-  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}?v=2">
+  <script src="{{ url_for('static', filename='site-library.js') }}?v=2" defer></script>
+  <script src="{{ url_for('static', filename='dashboard.js') }}?v=2" defer></script>
 </head>
 <body data-sub-url="{{ sub_url }}">
-<header class="topbar">
-  <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>TVBox <strong>Manager</strong></div>
-  <nav class="top-actions" aria-label="账户"><span>{{ username }}</span>{% if is_admin %}<a href="/admin">系统管理</a>{% endif %}<a href="{{ url_for('api_logout') }}">退出</a></nav>
-</header>
-<main class="workspace">
-  <div class="page-heading"><div><p class="eyebrow">聚合配置 / 站点控制</p><h1>所有站点，一处管理</h1><p class="intro">按分组、状态和类型快速处理站点；电视始终使用同一份整合配置。</p></div><button class="button button-quiet" id="reloadSites" type="button">刷新列表</button></div>
-  <section class="subscription"><div><p class="eyebrow">电视端使用</p><h2>整合订阅地址</h2><p>已启用的站点会自动写入这份配置。</p></div><div class="subscription-link"><code id="subLink">{{ sub_url }}</code><button class="button button-primary" id="copyLink" type="button">复制地址</button><button class="button button-outline" id="previewButton" type="button">预览 JSON</button></div></section>
-  <section class="summary" aria-label="站点统计"><div class="stat"><span>站点总数</span><strong id="totalCount">—</strong></div><div class="stat"><span>已启用</span><strong id="enabledCount">—</strong></div><div class="stat"><span>搜索可用</span><strong id="onlineCount">—</strong></div><div class="stat"><span>配置来源</span><strong id="sourceCount">—</strong></div></section>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span><strong>TVBox</strong><span>Manager</span></div>
+    <nav class="account-nav" aria-label="账户"><span>{{ username }}</span>{% if is_admin %}<a href="/admin">系统管理</a>{% endif %}<a href="{{ url_for('api_logout') }}">退出</a></nav>
+  </header>
 
-  <div class="management-layout">
-    <aside class="panel group-sidebar" aria-labelledby="groupsTitle">
-      <div class="section-heading"><div><p class="eyebrow">分类管理</p><h2 id="groupsTitle">分组</h2></div></div>
-      <p class="hint">点击查看；把右侧站点拖到分组上即可移动。</p>
-      <nav id="groupNav" class="group-nav" aria-label="站点分组"></nav>
-      <form id="newGroupForm" class="new-group-form"><label>新建分组<input id="newGroupName" required maxlength="40" placeholder="如：纪录片"></label><label>用途说明<input id="newGroupDescription" maxlength="240" placeholder="给模型判断时参考"></label><button class="button button-quiet" type="submit">添加分组</button></form>
-    </aside>
+  <main class="workspace">
+    <section class="subscription" aria-label="整合配置订阅">
+      <div class="subscription-label"><strong>整合订阅</strong><span id="librarySummary" class="muted">正在读取站点…</span></div>
+      <code id="subLink">{{ sub_url }}</code>
+      <div class="subscription-actions"><button class="button primary" id="copyLink" type="button">复制地址</button><button class="button quiet" id="previewButton" type="button">预览配置</button></div>
+    </section>
 
-    <div class="management-main">
-      <section class="panel sites-panel">
-        <div class="section-heading"><div><p class="eyebrow">站点列表</p><h2 id="currentGroupTitle">全部站点</h2></div><p id="probeProgress" class="muted" role="status" aria-live="polite">勾选即生效</p></div>
-        <div class="selection-bar" aria-label="当前范围的站点启用状态"><div class="selection-copy"><strong id="selectionScope">全部站点</strong><span id="selectionSummary">正在读取站点…</span></div><div class="selection-actions"><button class="button button-primary" id="selectAllEnable" type="button" disabled>全选启用</button><button class="button button-outline" id="selectAllDisable" type="button" disabled>全选停用</button></div></div>
-        <div class="bulk-bar"><label class="bulk-label">快速操作<select id="batchAction" aria-label="选择批量操作">
-          <option value="">选择操作…</option>
-          <optgroup label="全部站点"><option value="disable_failed">停用探测失败</option><option value="disable_unsupported">停用需电视端验证</option><option value="enable_cms">启用全部 CMS</option><option value="disable_cms">停用全部 CMS</option><option value="enable_spider">启用全部 Spider</option><option value="disable_spider">停用全部 Spider</option></optgroup>
-          <optgroup label="当前分组"><option value="enable_group">启用当前分组</option><option value="disable_group">停用当前分组</option><option value="enable_visible">启用当前筛选</option><option value="disable_visible">停用当前筛选</option></optgroup>
-        </select></label><span id="batchPreview" class="muted">选择操作后显示影响数量</span><button class="button button-primary" id="applyBatch" type="button" disabled>执行操作</button></div>
-        <div class="toolbar"><label class="search-wrap"><span class="sr-only">搜索站点或来源</span><input id="siteSearch" type="search" placeholder="搜索站点名称、来源或 Key"></label><select id="statusFilter" aria-label="按状态筛选"><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option><option value="online">搜索可用</option><option value="resource">资源可达</option><option value="failed">探测失败</option><option value="unsupported">需电视端验证</option><option value="unprobed">未探测</option></select><select id="sortSites" aria-label="排序"><option value="source">按来源顺序</option><option value="latency">按响应延迟</option><option value="name">按站点名称</option></select><input id="probeKeyword" value="庆余年" maxlength="40" aria-label="探测搜索词" title="CMS 站点搜索词"><button class="button button-primary" id="probeVisible" type="button">探测当前列表</button></div>
-        <p class="hint">CMS 测搜索与详情；Spider 只测独立脚本或接口的响应延迟。资源可达并不代表电视端搜索或播放可用。</p>
-        <div id="siteErrors" class="notice" hidden></div>
-        <div class="table-scroll"><table><thead><tr><th>启用</th><th>站点 / 来源</th><th>分组</th><th>类型</th><th>探测结果</th><th class="numeric">搜索</th><th class="numeric">详情</th><th class="numeric">播放首段</th><th class="numeric">速度</th><th>操作</th></tr></thead><tbody id="siteRows"><tr><td colspan="10" class="empty">正在读取站点…</td></tr></tbody></table></div><div class="table-footer"><span id="shownCount">—</span><span>延迟单位：毫秒；— 表示未测得</span></div>
-      </section>
-
-      <section class="panel ai-panel" id="aiPanel" aria-labelledby="aiTitle">
-        <div class="section-heading"><div><p class="eyebrow">Jev 分类建议</p><h2 id="aiTitle">当前分组审核</h2></div><span id="modelStatus" class="muted">未接入模型</span></div>
-        <p class="hint">模型只给建议。你可以按置信度预选、取消误判；确认后才会移动站点。分析时仅发送站点名称、Key、来源、类型和分组说明。</p>
-        <div class="ai-controls"><label>置信度基线 <strong id="thresholdLabel">70%</strong><input id="confidenceThreshold" type="range" min="0" max="100" value="70"></label><button class="button button-primary" id="analyzeGroup" type="button">分析当前分组</button><span id="analysisProgress" class="muted" role="status" aria-live="polite"></span></div>
-        <div id="suggestionRows" class="suggestions"><p class="empty">选择分组并接入 Jev 后，可在这里审核分类建议。</p></div>
-        <details class="model-settings" id="modelSettings"><summary>模型接入设置</summary><form id="modelForm"><label>服务<select id="modelProvider"><option value="openrouter">OpenRouter（推荐）</option><option value="typesafe">TypeSafe 官方</option></select></label><label>模型名称<input id="modelName" value="typesafe/jev-1.13" required></label><label>API Key<input id="modelKey" type="password" autocomplete="new-password" placeholder="已保存的 Key 不会显示"></label><button class="button button-quiet" type="submit">保存接入设置</button></form><p class="hint">API Key 在服务端加密保存；修改服务时需要输入对应的新 Key。</p></details>
-      </section>
+    <div class="workspace-navigation">
+      <nav class="view-nav" aria-label="工作区">
+        <button class="view-tab active" data-view="library" type="button">站点管理</button>
+        <button class="view-tab" data-view="review" type="button">分类审核</button>
+        <button class="view-tab" data-view="sources" type="button">配置来源</button>
+        <button class="view-tab" data-view="settings" type="button">模型设置</button>
+      </nav>
+      <button class="button quiet" id="reloadSites" type="button">刷新列表</button>
     </div>
-  </div>
 
-  <section class="panel"><div class="section-heading"><div><p class="eyebrow">配置来源</p><h2>导入与维护</h2></div><button class="button button-quiet" id="refreshAllSources" type="button">刷新原始配置</button></div><p class="hint">新导入站点先进入“未分类”；刷新原配置会保留已有分组和启用选择。</p><form id="sourceForm" class="source-form"><input type="hidden" id="sourceId"><label>名称<input id="sourceName" required placeholder="例如：饭太硬"></label><label>配置 URL<input id="sourceUrl" type="url" required placeholder="https://…/config.json"></label><label>类型<select id="sourceType"><option value="site">TVBox 配置</option><option value="live">直播地址</option></select></label><button class="button button-primary" id="saveSource" type="submit">添加配置</button><button class="button button-quiet" id="cancelEdit" type="button" hidden>取消</button></form><div id="sourceRows" class="source-list"><p class="empty">正在读取来源…</p></div></section>
-</main>
-<dialog id="previewDialog" class="preview-dialog"><div class="dialog-head"><h2>整合配置预览</h2><button class="button button-quiet" id="closePreview" type="button">关闭</button></div><pre id="jsonPreview">正在生成…</pre></dialog>
-<dialog id="groupDialog" class="group-dialog"><form id="editGroupForm"><h2>编辑分组</h2><input type="hidden" id="editGroupId"><label>名称<input id="editGroupName" required maxlength="40"></label><label>用途说明<input id="editGroupDescription" maxlength="240"></label><div class="dialog-actions"><button class="button button-quiet danger" id="deleteGroup" type="button">删除分组</button><button class="button button-quiet" id="cancelGroupEdit" type="button">取消</button><button class="button button-primary" type="submit">保存</button></div></form></dialog>
-<div id="toast" class="toast" role="status" aria-live="polite"></div>
-</body></html>
+    <div id="pageError" class="notice error" role="alert" hidden></div>
+    <div id="jobStatus" class="job-status" role="status" hidden><span id="jobMessage"></span><button class="button quiet" id="stopJob" type="button">停止后续任务</button></div>
+
+    <div id="managementLayout" class="management-layout">
+      <aside class="group-sidebar" aria-labelledby="groupsTitle">
+        <div class="sidebar-heading"><h2 id="groupsTitle">站点分组</h2><button class="text-button" id="addGroup" type="button">＋ 新建</button></div>
+        <nav id="groupNav" class="group-nav" aria-label="站点分组"></nav>
+        <p class="sidebar-hint">可拖动站点到目标分组。<br>分组调整不改变启用状态。</p>
+      </aside>
+
+      <div class="management-main">
+        <section id="libraryView" class="panel library-panel" aria-labelledby="currentGroupTitle">
+          <header class="panel-heading library-heading">
+            <div><h1 id="currentGroupTitle">全部站点</h1><p id="scopeSummary" class="muted">正在读取站点…</p></div>
+            <div class="scope-actions"><button class="button primary" id="selectAllEnable" type="button" disabled>全选启用</button><button class="button quiet" id="selectAllDisable" type="button" disabled>全选停用</button></div>
+          </header>
+
+          <div class="filter-bar" aria-label="筛选站点">
+            <label class="search-field"><span class="sr-only">搜索站点、来源或 Key</span><input id="siteSearch" type="search" placeholder="搜索站点、来源或 Key"></label>
+            <select id="sourceFilter" aria-label="配置来源"><option value="all">全部来源</option></select>
+            <select id="typeFilter" aria-label="站点类型"><option value="all">全部类型</option><option value="cms">CMS</option><option value="spider">Spider</option></select>
+            <select id="enabledFilter" aria-label="启用状态"><option value="all">全部启用状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select>
+            <select id="statusFilter" aria-label="探测结果"><option value="all">全部探测结果</option><option value="online">搜索可用</option><option value="no_match">搜索无结果</option><option value="resource_only">仅资源可达</option><option value="failed">探测失败</option><option value="unsupported">待电视验证</option><option value="needs_recheck">旧结果待重测</option><option value="unprobed">未探测</option></select>
+            <select id="sortSites" aria-label="站点排序"><option value="source">按来源顺序</option><option value="name">按站点名称</option><option value="search">按搜索延迟</option><option value="resource">按资源延迟</option></select>
+            <button class="text-button" id="clearFilters" type="button">清空筛选</button>
+          </div>
+          <p id="scopeNote" class="scope-note">操作范围为当前分组的筛选结果，包含所有分页。</p>
+
+          <div class="selection-workbench" aria-label="选择与批量操作">
+            <div class="selection-tools">
+              <strong id="selectionSummary" aria-live="polite">已选 0 个</strong>
+              <button class="button quiet" id="selectFiltered" type="button">选择全部筛选结果</button>
+              <select id="quickSelect" aria-label="按条件快速选择"><option value="">快速选择…</option><option value="failed">选中探测失败</option><option value="unsupported">选中待电视验证</option><option value="cms">选中 CMS</option><option value="spider">选中 Spider</option></select>
+              <button class="text-button" id="clearSelection" type="button">取消选择</button>
+            </div>
+            <div class="selected-actions">
+              <span class="toolbar-label">对选中项</span>
+              <button class="button quiet" id="enableSelected" type="button" disabled>启用</button>
+              <button class="button quiet" id="disableSelected" type="button" disabled>停用</button>
+              <div class="move-controls"><select id="moveTarget" aria-label="移动到目标分组"><option value="">选择目标分组</option><option value="unclassified">未分类</option></select><button class="button quiet" id="moveSelected" type="button" disabled>移动到分组</button></div>
+            </div>
+          </div>
+
+          <div class="probe-tools">
+            <label class="keyword-field">探测搜索词<input id="probeKeyword" value="庆余年" maxlength="40" aria-label="探测搜索词"></label>
+            <button class="button quiet" id="probeSelected" type="button" disabled>探测选中项</button>
+            <button class="text-button" id="probeFiltered" type="button">探测全部筛选结果</button>
+            <span class="muted probe-note">资源可达不等于搜索或播放可用。</span>
+          </div>
+          <div id="siteErrors" class="notice error inset-notice" hidden></div>
+
+          <div class="table-scroll" tabindex="0" aria-label="站点列表">
+            <table class="site-table">
+              <thead><tr><th class="check-cell"><input id="selectPage" class="site-select" type="checkbox" aria-label="选择当前页全部站点"></th><th>站点 / 来源</th><th>分组</th><th>探测结果</th><th>响应时间</th><th>启用</th><th>操作</th></tr></thead>
+              <tbody id="siteRows"><tr><td colspan="7" class="empty">正在读取站点…</td></tr></tbody>
+            </table>
+          </div>
+          <footer class="table-footer"><span id="shownCount" class="muted">—</span><div class="pagination"><label>每页 <select id="pageSize" aria-label="每页站点数"><option value="25">25</option><option value="50" selected>50</option><option value="100">100</option></select></label><button class="button quiet" id="previousPage" type="button" disabled>上一页</button><span id="pageNumber">1 / 1</span><button class="button quiet" id="nextPage" type="button" disabled>下一页</button></div></footer>
+        </section>
+
+        <section id="reviewView" class="panel review-panel" aria-labelledby="aiTitle" hidden>
+          <header class="panel-heading"><div><h1 id="aiTitle">分类审核</h1><p id="reviewScope" class="muted">选择左侧一个分组开始审核。</p></div><button class="button primary" id="analyzeGroup" type="button" disabled>分析当前分组</button></header>
+          <p id="modelNotice" class="notice inset-notice">接入模型后可获取分类建议。<button class="text-button" data-open-view="settings" type="button">前往模型设置</button></p>
+          <div class="review-controls"><label class="threshold-control">置信度基线 <strong id="thresholdLabel">70%</strong><input id="confidenceThreshold" type="range" min="0" max="100" value="70"></label><button class="button quiet" id="preselectSuggestions" type="button">按基线重新预选</button><button class="text-button" id="clearSuggestions" type="button">取消全部选择</button></div>
+          <div class="review-description"><p id="reviewRule">先检查预选项，取消误判，再确认移动。调整基线不会覆盖已做的手动选择。</p><span id="analysisProgress" class="muted" role="status" aria-live="polite"></span></div>
+          <div id="suggestionRows" class="suggestions"><p class="empty">选择左侧一个分组或“未分类”，生成分类建议。</p></div>
+        </section>
+      </div>
+    </div>
+
+    <section id="sourcesView" class="panel standalone-panel" aria-labelledby="sourcesTitle" hidden>
+      <header class="panel-heading"><div><h1 id="sourcesTitle">配置来源</h1><p class="muted">多份配置汇入同一个站点库，电视使用同一条整合订阅。</p></div><button class="button quiet" id="refreshAllSources" type="button">刷新原始配置</button></header>
+      <form id="sourceForm" class="source-form">
+        <input type="hidden" id="sourceId">
+        <label>名称<input id="sourceName" required placeholder="例如：饭太硬"></label>
+        <label class="source-url-field">配置 URL<input id="sourceUrl" type="url" required placeholder="https://…/config.json"></label>
+        <label>类型<select id="sourceType"><option value="site">TVBox 配置</option><option value="live">直播地址</option></select></label>
+        <div class="form-actions"><button class="button primary" id="saveSource" type="submit">添加配置</button><button class="button quiet" id="cancelEdit" type="button" hidden>取消</button></div>
+      </form>
+      <p class="section-hint">新站点进入“未分类”。刷新来源会保留已有站点的分组和启用选择。</p>
+      <div id="sourceRows" class="source-list"><p class="empty">正在读取来源…</p></div>
+    </section>
+
+    <section id="settingsView" class="panel standalone-panel" aria-labelledby="settingsTitle" hidden>
+      <header class="panel-heading"><div><h1 id="settingsTitle">模型接入</h1><p class="muted">使用 Jev 为站点提供分类建议，审核确认后才会调整分组。</p></div><span id="modelStatus" class="connection-status">未接入模型</span></header>
+      <form id="modelForm" class="model-form">
+        <label>接入服务<select id="modelProvider"><option value="openrouter">OpenRouter</option><option value="typesafe">TypeSafe 官方</option></select></label>
+        <label>模型名称<input id="modelName" value="typesafe/jev-1.13" required></label>
+        <label class="model-key-field">API Key<input id="modelKey" type="password" autocomplete="new-password" placeholder="留空保留已保存的 Key"></label>
+        <button class="button primary" type="submit">保存接入设置</button>
+      </form>
+      <div class="settings-notes"><p>分析时仅发送站点名称、Key、来源、类型以及分组名称和说明。</p><p>API Key 在服务端加密保存；修改接入服务时，请填写对应的新 Key。</p><button class="text-button" data-open-view="review" type="button">前往分类审核 →</button></div>
+    </section>
+  </main>
+
+  <dialog id="confirmDialog" class="dialog" aria-labelledby="confirmTitle"><form method="dialog"><h2 id="confirmTitle">确认操作</h2><p id="confirmMessage"></p><ul id="confirmNames" class="confirm-names"></ul><div class="dialog-actions"><button class="button quiet" type="submit" value="cancel">取消</button><button class="button primary" id="confirmApply" type="submit" value="confirm">确认执行</button></div></form></dialog>
+  <dialog id="previewDialog" class="dialog wide" aria-labelledby="previewTitle"><div class="dialog-heading"><h2 id="previewTitle">整合配置预览</h2><button class="button quiet" id="closePreview" type="button">关闭</button></div><pre id="jsonPreview">正在生成…</pre></dialog>
+  <dialog id="groupDialog" class="dialog" aria-labelledby="groupDialogTitle"><form id="editGroupForm"><h2 id="groupDialogTitle">编辑分组</h2><input id="editGroupId" type="hidden"><label>分组名称<input id="editGroupName" required maxlength="40" placeholder="例如：教育课堂"></label><label>分组说明<textarea id="editGroupDescription" rows="3" maxlength="240" placeholder="说明应包含哪些内容，供你和模型分类时参考"></textarea></label><div class="dialog-actions"><button class="button danger" id="deleteGroup" type="button">删除分组</button><button class="button quiet" id="cancelGroupEdit" type="button">取消</button><button class="button primary" type="submit">保存分组</button></div></form></dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

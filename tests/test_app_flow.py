@@ -50,6 +50,9 @@ class AppFlowTests(unittest.TestCase):
         aggregate = self.client.get('/api/site/list').json['data']
         self.assertEqual([(site['source_name'], site['key']) for site in aggregate],
                          [('甲', 'a'), ('甲', 'same'), ('乙', 'same')])
+        self.assertTrue(all(not site['enabled'] and site['group_id'] is None for site in aggregate))
+        self.client.post('/api/site/batch_enable', json={'enabled': True, 'sites': [
+            {'source_id': site['source_id'], 'key': site['key']} for site in aggregate]})
         self.assertEqual(self.client.post('/api/site/enable', json={
             'source_id': 1, 'key': 'a', 'enabled': False}).json['status'], 'success')
         merged = self.client.get('/api/subscribe/tester.json').json
@@ -64,6 +67,7 @@ class AppFlowTests(unittest.TestCase):
                 {'sites': [{'key': 'one', 'name': 'One', 'type': 1,
                             'api': 'https://example.org/api'}]}, 10)):
             self.client.get('/api/source/1/sites')
+        self.client.post('/api/site/enable', json={'source_id': 1, 'key': 'one', 'enabled': True})
         self.client.post('/api/source/enable', json={'id': 1, 'enabled': False})
         self.client.post('/api/source/delete', json={'id': 2})
         self.assertEqual([site['key'] for site in self.client.get('/api/subscribe/tester.json').json['sites']],
@@ -96,6 +100,7 @@ class AppFlowTests(unittest.TestCase):
                              'api': 'https://example.org/api'}]}
         with patch.object(self.module, 'load_config', return_value=(config, 20)):
             self.client.get('/api/source/1/sites')
+        self.client.post('/api/site/enable', json={'source_id': 1, 'key': 'a', 'enabled': True})
         with patch.object(self.module, 'probe_site', return_value={
             'status': 'online', 'stage': 'detail', 'search_ms': 12, 'detail_ms': 15}):
             response = self.client.post('/api/site/probe', json={
@@ -120,8 +125,11 @@ class AppFlowTests(unittest.TestCase):
             {'key': 'notice', 'name': '请勿相信视频中任何广告', 'type': 3, 'api': 'csp_Notice'},
             {'key': 'unknown', 'name': '海星', 'type': 3, 'api': 'csp_Sea'},
         ]}
-        with patch.object(self.module, 'load_config', return_value=(config, 10)):
-            groups = self.client.get('/api/group/list').json['data']
+        with self.module.get_db() as db:
+            db.execute('INSERT INTO source_configs (source_id, body, fetched_at) VALUES (1, ?, ?)',
+                       (json.dumps(config), 'now'))
+            db.execute('DELETE FROM sources WHERE id = 2')
+        groups = self.client.get('/api/group/list').json['data']
         names = {group['id']: group['name'] for group in groups}
         listing = {site['key']: site for site in self.client.get('/api/site/list').json['data']}
         self.assertEqual(names[listing['anime']['group_id']], '动漫')
@@ -230,6 +238,152 @@ class AppFlowTests(unittest.TestCase):
         self.assertEqual(result.json['data'], [])
         self.assertIn('原配置已更新', result.json['errors'][0]['message'])
         self.assertEqual(self.client.get('/api/group/suggestions?group_id=unclassified').json['data'], [])
+
+    def test_refresh_only_resets_changed_sites_and_leaves_new_sites_disabled(self):
+        old = {'sites': [
+            {'key': 'same', 'name': '原站点', 'type': 1, 'api': 'https://example.org/same'},
+            {'key': 'changed', 'name': '变更站点', 'type': 1, 'api': 'https://example.org/old'},
+            {'key': 'removed', 'name': '移除站点'}]}
+        updated = {'sites': [old['sites'][0],
+            {'key': 'changed', 'name': '变更站点', 'type': 1, 'api': 'https://example.org/new'},
+            {'key': 'new', 'name': '新动漫', 'type': 3}]}
+        with self.module.get_db() as db:
+            db.execute('DELETE FROM sources WHERE id = 2')
+            db.execute('INSERT INTO source_configs VALUES (1, ?, ?)', (json.dumps(old), 'before'))
+            db.execute("INSERT INTO site_groups (id, user_id, name) VALUES (99, 1, '手动分类')")
+            for key, enabled in [('same', 0), ('changed', 1), ('removed', 1)]:
+                db.execute('''INSERT INTO site_preferences (source_id, site_key, enabled, group_id, result, checked_at)
+                    VALUES (1, ?, ?, 99, ?, ?)''', (key, enabled, json.dumps({'status': 'online'}), 'before'))
+        with patch.object(self.module, 'load_config', return_value=(updated, 12)):
+            response = self.client.get('/api/source/1/sites?refresh=true').json
+        self.assertEqual(response['changes'], {'added': 1, 'removed': 1, 'changed': 1, 'unchanged': 1})
+        rows = {site['key']: site for site in self.client.get('/api/site/list').json['data']}
+        self.assertFalse(rows['same']['enabled'])
+        self.assertEqual(rows['same']['group_id'], 99)
+        self.assertEqual(rows['same']['result']['status'], 'online')
+        self.assertEqual(rows['same']['checked_at'], 'before')
+        self.assertTrue(rows['changed']['enabled'])
+        self.assertEqual(rows['changed']['group_id'], 99)
+        self.assertIsNone(rows['changed']['result'])
+        self.assertFalse(rows['new']['enabled'])
+        self.assertIsNone(rows['new']['group_id'])
+        counts = self.client.get('/api/source/list').json['data'][0]
+        self.assertEqual((counts['site_count'], counts['enabled_count']), (3, 1))
+        self.assertNotEqual(counts['fetched_at'], 'before')
+        self.assertEqual([site['key'] for site in self.client.get('/api/subscribe/tester.json').json['sites']], ['changed'])
+
+    def test_legacy_cached_sites_keep_default_enabled_when_preferences_are_missing(self):
+        config = {'sites': [{'key': 'legacy', 'name': '原站点'}]}
+        with self.module.get_db() as db:
+            db.execute('DELETE FROM sources WHERE id = 2')
+            db.execute('INSERT INTO source_configs VALUES (1, ?, ?)', (json.dumps(config), 'before'))
+        with patch.object(self.module, 'load_config', return_value=(config, 12)):
+            refreshed = self.client.get('/api/source/1/sites?refresh=true').json
+        self.assertEqual(refreshed['changes'], {'added': 0, 'removed': 0, 'changed': 0, 'unchanged': 1})
+        self.assertTrue(refreshed['data'][0]['enabled'])
+        self.assertEqual(len(self.client.get('/api/subscribe/tester.json').json['sites']), 1)
+
+    def test_first_site_listing_reads_new_disabled_preferences_immediately(self):
+        with patch.object(self.module, 'load_config', return_value=(
+                {'sites': [{'key': 'new', 'name': '新站点'}]}, 12)):
+            sites = self.client.get('/api/site/list').json['data']
+        self.assertEqual(len(sites), 2)
+        self.assertTrue(all(not site['enabled'] and site['group_id'] is None for site in sites))
+
+    def test_refreshing_inherited_spider_invalidates_probe_without_resetting_choice(self):
+        site = {'key': 'spider', 'name': '旧站点', 'type': 3, 'api': 'csp_Example'}
+        with self.module.get_db() as db:
+            db.execute('DELETE FROM sources WHERE id = 2')
+            db.execute('INSERT INTO source_configs VALUES (1, ?, ?)',
+                       (json.dumps({'spider': 'https://example.org/old.jar', 'sites': [site]}), 'before'))
+            db.execute('''INSERT INTO site_preferences (source_id, site_key, enabled, result)
+                VALUES (1, 'spider', 1, ?)''', (json.dumps({'status': 'resource_only'}),))
+        with patch.object(self.module, 'load_config', return_value=(
+                {'spider': 'https://example.org/new.jar', 'sites': [site]}, 12)):
+            response = self.client.get('/api/source/1/sites?refresh=true').json
+        self.assertEqual(response['changes']['changed'], 1)
+        self.assertTrue(response['data'][0]['enabled'])
+        self.assertIsNone(response['data'][0]['result'])
+
+    def test_source_url_change_preserves_choices_and_failure_preserves_old_snapshot(self):
+        original = {'sites': [{'key': 'one', 'name': 'One'}]}
+        with self.module.get_db() as db:
+            db.execute('DELETE FROM sources WHERE id = 2')
+            db.execute('INSERT INTO source_configs VALUES (1, ?, ?)', (json.dumps(original), 'before'))
+            db.execute("INSERT INTO site_groups (id, user_id, name) VALUES (99, 1, '手动分类')")
+            db.execute('INSERT INTO site_preferences (source_id, site_key, enabled, group_id) VALUES (1, ?, 0, 99)', ('one',))
+        payload = {'id': 1, 'name': '新地址', 'url': 'https://example.org/replacement.json', 'type': 'site'}
+        with patch.object(self.module, 'load_config', side_effect=ValueError('bad json')):
+            failed = self.client.post('/api/source/update', json=payload)
+        self.assertEqual(failed.status_code, 502)
+        source = self.client.get('/api/source/list').json['data'][0]
+        self.assertEqual(source['url'], 'https://example.org/a.json')
+        self.assertEqual(source['name'], '甲')
+        self.assertEqual(source['fetched_at'], 'before')
+        with patch.object(self.module, 'load_config', return_value=(original, 12)):
+            saved = self.client.post('/api/source/update', json=payload)
+        self.assertEqual(saved.json['status'], 'success')
+        site = self.client.get('/api/site/list').json['data'][0]
+        self.assertFalse(site['enabled'])
+        self.assertEqual(site['group_id'], 99)
+        self.assertEqual(self.client.get('/api/source/list').json['data'][0]['url'], payload['url'])
+
+    def test_new_import_is_validated_and_starts_disabled_unclassified(self):
+        with self.module.get_db() as db:
+            db.execute('DELETE FROM sources')
+        payload = {'name': '新配置', 'url': 'https://example.org/new.json', 'type': 'site'}
+        with patch.object(self.module, 'parse_aggregate_source', return_value=None), \
+             patch.object(self.module, 'load_config', side_effect=ValueError('bad json')):
+            failed = self.client.post('/api/source/add', json=payload)
+        self.assertEqual(failed.status_code, 502)
+        self.assertEqual(self.client.get('/api/source/list').json['data'], [])
+        config = {'sites': [{'key': 'anime', 'name': '动漫', 'type': 3}]}
+        with patch.object(self.module, 'parse_aggregate_source', return_value=None), \
+             patch.object(self.module, 'load_config', return_value=(config, 12)):
+            added = self.client.post('/api/source/add', json=payload)
+        self.assertEqual(added.json['changes']['added'], 1)
+        self.client.get('/api/group/list')
+        site = self.client.get('/api/site/list').json['data'][0]
+        self.assertFalse(site['enabled'])
+        self.assertIsNone(site['group_id'])
+        self.assertEqual(self.client.get('/api/subscribe/tester.json').json['sites'], [])
+
+    def test_analysis_drops_results_if_group_definitions_change_during_request(self):
+        with self.module.get_db() as db:
+            db.execute('INSERT INTO source_configs VALUES (1, ?, ?)',
+                       (json.dumps({'sites': [{'key': 'one', 'name': 'One'}]}), 'now'))
+            db.execute('DELETE FROM sources WHERE id = 2')
+        groups = self.client.get('/api/group/list').json['data']
+        self.client.post('/api/model/settings', json={'provider': 'openrouter', 'api_key': 'test-key-private'})
+        def classify(*args):
+            with self.module.get_db() as db:
+                db.execute('UPDATE site_groups SET description = ? WHERE id = ?', ('分类标准已变更', groups[0]['id']))
+            return {'suggested_group_id': groups[0]['id'], 'confidence': 0.9,
+                    'membership': None, 'probabilities': {}}
+        with patch.object(self.module, 'classify_with_jev', side_effect=classify):
+            response = self.client.post('/api/group/analyze', json={
+                'group_id': None, 'sites': [{'source_id': 1, 'key': 'one'}]})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('分组定义已变化', response.json['message'])
+        self.assertEqual(self.client.get('/api/group/suggestions?group_id=unclassified').json['data'], [])
+
+    def test_probe_drops_result_when_source_changes_during_request(self):
+        old = {'sites': [{'key': 'one', 'name': 'One', 'type': 1, 'api': 'https://example.org/old'}]}
+        with self.module.get_db() as db:
+            db.execute('INSERT INTO source_configs VALUES (1, ?, ?)', (json.dumps(old), 'before'))
+            db.execute('DELETE FROM sources WHERE id = 2')
+        def probe(*args):
+            updated = {'sites': [{**old['sites'][0], 'api': 'https://example.org/new'}]}
+            with self.module.get_db() as db:
+                db.execute('UPDATE source_configs SET body = ? WHERE source_id = 1', (json.dumps(updated),))
+            return {'status': 'online', 'stage': 'detail', 'keyword': '测试', 'search_ms': 12}
+        with patch.object(self.module, 'probe_site', side_effect=probe):
+            response = self.client.post('/api/site/probe', json={'source_id': 1, 'key': 'one', 'keyword': '测试'})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn('原配置已更新', response.json['message'])
+        site = self.client.get('/api/site/list').json['data'][0]
+        self.assertIsNone(site['result'])
+        self.assertEqual(site['api'], 'https://example.org/new')
 
 
 if __name__ == '__main__':

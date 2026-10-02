@@ -36,6 +36,15 @@ class MergeTests(unittest.TestCase):
         }, online_only=True)
         self.assertEqual([s['key'] for s in merged['sites']], ['good'])
 
+    def test_toggling_colliding_sites_keeps_public_keys_stable(self):
+        inputs = [(1, {'sites': [{'key': 'same', 'name': 'A'}]}),
+                  (2, {'sites': [{'key': 'same', 'name': 'B'}, {'key': 'unique', 'name': 'C'}]})]
+        before = {site['name']: site['key'] for site in merge_configs(inputs)['sites']}
+        after = {site['name']: site['key'] for site in merge_configs(inputs, {
+            (1, 'same'): {'enabled': False}})['sites']}
+        self.assertEqual(after, {'B': before['B'], 'C': 'unique'})
+        self.assertEqual(after['B'], '2_same')
+
 
 class ProbeTests(unittest.TestCase):
     @patch('site_probe.fetch_limited')
@@ -60,6 +69,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(result['status'], 'online')
         self.assertEqual(result['stage'], 'playback')
         self.assertEqual(result['search_ms'], 27)
+        self.assertEqual(result['keyword'], '测试')
 
     def test_spider_is_not_reported_online_without_client_runtime(self):
         result = probe_site({'type': 3, 'api': 'csp_Example'})
@@ -80,10 +90,29 @@ class ProbeTests(unittest.TestCase):
         fetch.assert_not_called()
 
     @patch('site_probe.fetch_limited', return_value=(b'{"list":[]}', 35))
-    def test_empty_search_is_failure(self, fetch):
+    def test_empty_search_is_reachable_but_not_a_failure(self, fetch):
+        result = probe_site({'type': 1, 'api': 'https://example.org/api'})
+        self.assertEqual(result['status'], 'no_match')
+        self.assertEqual(result['stage'], 'search')
+        self.assertEqual(result['search_ms'], 35)
+        self.assertEqual(result['keyword'], '测试')
+
+    @patch('site_probe.fetch_limited', return_value=(b'{"error":"Unauthorized"}', 35))
+    def test_invalid_cms_response_is_not_reported_as_no_match(self, fetch):
         result = probe_site({'type': 1, 'api': 'https://example.org/api'})
         self.assertEqual(result['status'], 'failed')
-        self.assertEqual(result['stage'], 'search')
+        self.assertIn('list', result['error'])
+        self.assertEqual(result['keyword'], '测试')
+
+    def test_unsupported_cms_endpoint_keeps_the_requested_keyword(self):
+        result = probe_site({'type': 1, 'api': 'not-an-http-api'}, '动漫')
+        self.assertEqual(result['status'], 'unsupported')
+        self.assertEqual(result['keyword'], '动漫')
+
+    @patch('site_probe.fetch_limited', return_value=(b'<rss><list></list></rss>', 35))
+    def test_empty_xml_search_is_reachable_but_not_a_failure(self, fetch):
+        result = probe_site({'type': 0, 'api': 'https://example.org/api'})
+        self.assertEqual(result['status'], 'no_match')
 
 
 if __name__ == '__main__':

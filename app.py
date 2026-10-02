@@ -189,16 +189,55 @@ def source_for_user(db, source_id, user_id):
     return db.execute('SELECT * FROM sources WHERE id = ? AND user_id = ?', (source_id, user_id)).fetchone()
 
 
-def refresh_config(db, source):
-    config, latency_ms = load_config(source['url'])
-    config = normalize_resources(config, source['url'])
+def config_sites(config):
+    return {site_key(site): site for site in config.get('sites') or []
+            if isinstance(site, dict) and site_key(site)}
+
+
+def site_definition(config, site):
+    """Include the inherited Spider resource when comparing probe inputs."""
+    definition = dict(site)
+    if site.get('type') == 3 and str(site.get('api', '')).startswith('csp_') and not site.get('jar'):
+        definition['jar'] = config.get('spider')
+    return definition
+
+
+def save_config(db, source, config, latency_ms):
+    """Reconcile an imported snapshot while preserving choices for known keys."""
+    owner = db.execute('SELECT user_id FROM sources WHERE id = ?', (source['id'],)).fetchone()
+    if owner:
+        ensure_groups_bootstrapped(db, owner['user_id'])
+    previous = db.execute('SELECT body FROM source_configs WHERE source_id = ?', (source['id'],)).fetchone()
+    old_config = json.loads(previous['body']) if previous else {}
+    old_sites, new_sites = config_sites(old_config), config_sites(config)
+    added = new_sites.keys() - old_sites.keys()
+    removed = old_sites.keys() - new_sites.keys()
+    changed = {key for key in old_sites.keys() & new_sites.keys()
+               if site_definition(old_config, old_sites[key]) != site_definition(config, new_sites[key])}
+    for key in added:
+        db.execute('''INSERT INTO site_preferences (source_id, site_key, enabled, group_id)
+            VALUES (?, ?, 0, NULL) ON CONFLICT(source_id, site_key)
+            DO UPDATE SET enabled = 0, group_id = NULL, result = NULL, checked_at = NULL''',
+            (source['id'], key))
+    for key in added | removed | changed:
+        db.execute('UPDATE site_preferences SET result = NULL, checked_at = NULL WHERE source_id = ? AND site_key = ?',
+                   (source['id'], key))
+        db.execute('DELETE FROM group_suggestions WHERE source_id = ? AND site_key = ?', (source['id'], key))
     body = json.dumps(config, ensure_ascii=False)
     db.execute('INSERT OR REPLACE INTO source_configs (source_id, body, fetched_at) VALUES (?, ?, ?)',
                (source['id'], body, utc_now()))
     db.execute('UPDATE sources SET status = ?, latency_ms = ?, checked_at = ? WHERE id = ?',
                ('online', latency_ms, utc_now(), source['id']))
-    db.execute('UPDATE site_preferences SET result = NULL, checked_at = NULL WHERE source_id = ?', (source['id'],))
-    db.execute('DELETE FROM group_suggestions WHERE source_id = ?', (source['id'],))
+    return {'added': len(added), 'removed': len(removed), 'changed': len(changed),
+            'unchanged': len(new_sites) - len(added) - len(changed)}
+
+
+def refresh_config(db, source, changes=None):
+    config, latency_ms = load_config(source['url'])
+    config = normalize_resources(config, source['url'])
+    summary = save_config(db, source, config, latency_ms)
+    if changes is not None:
+        changes.update(summary)
     return config
 
 
@@ -217,10 +256,10 @@ def ensure_groups_bootstrapped(db, user_id):
         'SELECT id, name FROM site_groups WHERE user_id = ?', (user_id,))}
     sources = db.execute("SELECT * FROM sources WHERE user_id = ? AND type = 'site'", (user_id,)).fetchall()
     for source in sources:
-        try:
-            config = cached_config(db, source)
-        except (requests.RequestException, ValueError, UnicodeError):
+        cached = db.execute('SELECT body FROM source_configs WHERE source_id = ?', (source['id'],)).fetchone()
+        if not cached:
             continue
+        config = json.loads(cached['body'])
         for site in config.get('sites') or []:
             if not isinstance(site, dict) or not site_key(site):
                 continue
@@ -375,7 +414,17 @@ def api_logout():
 def api_source_list():
     with get_db() as db:
         sources = db.execute('SELECT * FROM sources WHERE user_id = ? ORDER BY order_index ASC, id ASC', (session['user_id'],)).fetchall()
-        return jsonify_success(data=[dict(row) for row in sources])
+        rows = []
+        for source in sources:
+            row = dict(source)
+            cached = db.execute('SELECT body, fetched_at FROM source_configs WHERE source_id = ?', (source['id'],)).fetchone()
+            known = config_sites(json.loads(cached['body'])) if cached and source['type'] == 'site' else {}
+            preferences = {pref['site_key']: pref['enabled'] for pref in db.execute(
+                'SELECT site_key, enabled FROM site_preferences WHERE source_id = ?', (source['id'],))}
+            row.update(site_count=len(known), enabled_count=sum(bool(preferences.get(key, 1)) for key in known),
+                       fetched_at=cached['fetched_at'] if cached else None)
+            rows.append(row)
+        return jsonify_success(data=rows)
 
 
 @app.route('/api/site/list')
@@ -384,10 +433,6 @@ def api_all_sites():
     with get_db() as db:
         sources = db.execute('''SELECT * FROM sources WHERE user_id = ? AND type = 'site'
             ORDER BY order_index ASC, id ASC''', (session['user_id'],)).fetchall()
-        preferences = {}
-        for row in db.execute('''SELECT p.* FROM site_preferences p
-            JOIN sources s ON s.id = p.source_id WHERE s.user_id = ?''', (session['user_id'],)):
-            preferences[(row['source_id'], row['site_key'])] = dict(row)
         rows = []
         errors = []
         for source in sources:
@@ -396,10 +441,12 @@ def api_all_sites():
             except (requests.RequestException, ValueError, UnicodeError) as exc:
                 errors.append({'source': source['name'], 'message': str(exc)[:160]})
                 continue
+            preferences = {row['site_key']: dict(row) for row in db.execute(
+                'SELECT * FROM site_preferences WHERE source_id = ?', (source['id'],))}
             for site in config['sites']:
                 if not isinstance(site, dict) or not site_key(site): continue
                 key = site_key(site)
-                pref = preferences.get((source['id'], key), {})
+                pref = preferences.get(key, {})
                 rows.append({
                     'source_id': source['id'], 'source_name': source['name'],
                     'key': key, 'name': site.get('name') or key,
@@ -419,30 +466,39 @@ def api_source_add():
     name, url, stype = data.get('name', '').strip(), data.get('url', '').strip(), data.get('type', 'site')
 
     if not name or not url: return jsonify_error('名称和 URL 不能为空')
-
-    # 1. 尝试作为多仓 JSON 解析
-    aggregate_urls = parse_aggregate_source(url)
-    if aggregate_urls:
-        added = 0
-        with get_db() as db:
-            existens = {row['url'] for row in db.execute('SELECT url FROM sources WHERE user_id = ?', (user_id,)).fetchall()}
-            for entry in aggregate_urls:
-                e_url = entry.get('url', '').strip()
-                if e_url and e_url not in existens:
-                    db.execute('INSERT INTO sources (user_id, name, url, type) VALUES (?, ?, ?, ?)', 
-                               (user_id, entry.get('name', '未命名'), e_url, stype))
-                    existens.add(e_url)
-                    added += 1
-            db.commit()
-        return jsonify_success(f'成功导入 {added} 个聚合接口')
-
-    # 2. 单个添加模式
+    if stype not in ('site', 'live'): return jsonify_error('来源类型无效', 400)
+    aggregate_urls = parse_aggregate_source(url) if stype == 'site' else None
+    candidates = aggregate_urls or [{'name': name, 'url': url}]
     with get_db() as db:
-        if db.execute('SELECT id FROM sources WHERE user_id = ? AND url = ?', (user_id, url)).fetchone():
-            return jsonify_error('该接口已在您的列表中')
-        db.execute('INSERT INTO sources (user_id, name, url, type) VALUES (?, ?, ?, ?)', (user_id, name, url, stype))
-        db.commit()
-    return jsonify_success('添加成功')
+        existing = {row['url'] for row in db.execute('SELECT url FROM sources WHERE user_id = ?', (user_id,))}
+        prepared = []
+        for entry in candidates:
+            if not isinstance(entry, dict) or not isinstance(entry.get('url'), str):
+                return jsonify_error('多仓配置中存在无效来源', 400)
+            entry_url = entry['url'].strip()
+            if not entry_url or entry_url in existing:
+                continue
+            try:
+                config, latency_ms = load_config(entry_url) if stype == 'site' else (None, None)
+                if config is not None:
+                    config = normalize_resources(config, entry_url)
+            except (requests.RequestException, ValueError, UnicodeError) as exc:
+                return jsonify_error(f'配置读取失败，未导入：{exc}', 502)
+            prepared.append((str(entry.get('name') or '未命名'), entry_url, config, latency_ms))
+            existing.add(entry_url)
+        if not prepared:
+            return jsonify_error('来源已在列表中，没有可导入的新来源', 409)
+        # Initialize preset groups before importing: new entries start unclassified.
+        ensure_groups_bootstrapped(db, user_id)
+        site_count = 0
+        for entry_name, entry_url, config, latency_ms in prepared:
+            cursor = db.execute('INSERT INTO sources (user_id, name, url, type) VALUES (?, ?, ?, ?)',
+                                (user_id, entry_name, entry_url, stype))
+            if config is not None:
+                summary = save_config(db, {'id': cursor.lastrowid}, config, latency_ms)
+                site_count += summary['added']
+    return jsonify_success(f'已导入 {len(prepared)} 个来源，新增 {site_count} 个站点，待选择启用',
+                           source_count=len(prepared), changes={'added': site_count, 'removed': 0, 'changed': 0, 'unchanged': 0})
 
 @app.route('/api/source/batch_add', methods=['POST'])
 @login_required
@@ -466,19 +522,29 @@ def api_source_update():
     data = request.json
     sid, name, url, stype = data.get('id'), data.get('name', '').strip(), data.get('url', '').strip(), data.get('type', 'site')
     if not sid or not name or not url: return jsonify_error('参数不全')
+    if stype not in ('site', 'live'): return jsonify_error('来源类型无效', 400)
 
+    changes = None
     with get_db() as db:
         old = source_for_user(db, sid, session['user_id'])
         if not old: return jsonify_error('接口不存在', 404)
+        config = None
+        if stype == 'site' and (old['url'] != url or old['type'] != stype):
+            try:
+                config, latency_ms = load_config(url)
+                config = normalize_resources(config, url)
+            except (requests.RequestException, ValueError, UnicodeError) as exc:
+                return jsonify_error(f'新配置读取失败，已保留原来源：{exc}', 502)
         db.execute('UPDATE sources SET name = ?, url = ?, type = ? WHERE id = ? AND user_id = ?', 
                    (name, url, stype, sid, session['user_id']))
-        if old['url'] != url:
+        if config is not None:
+            changes = save_config(db, old, config, latency_ms)
+        elif old['url'] != url or old['type'] != stype:
             db.execute('DELETE FROM source_configs WHERE source_id = ?', (sid,))
-            db.execute('DELETE FROM site_preferences WHERE source_id = ?', (sid,))
             db.execute('DELETE FROM group_suggestions WHERE source_id = ?', (sid,))
             db.execute('UPDATE sources SET status = ?, latency_ms = NULL, checked_at = NULL WHERE id = ?', ('unknown', sid))
         db.commit()
-    return jsonify_success('保存成功')
+    return jsonify_success('保存成功', changes=changes)
 
 @app.route('/api/source/delete', methods=['POST'])
 @login_required
@@ -554,11 +620,12 @@ def api_source_check():
 @login_required
 def api_source_sites(source_id):
     refresh = request.args.get('refresh') == 'true'
+    changes = {}
     with get_db() as db:
         source = source_for_user(db, source_id, session['user_id'])
         if not source: return jsonify_error('接口不存在', 404)
         try:
-            config = refresh_config(db, source) if refresh else cached_config(db, source)
+            config = refresh_config(db, source, changes) if refresh else cached_config(db, source)
         except (requests.RequestException, ValueError, UnicodeError) as exc:
             db.execute('UPDATE sources SET status = ?, checked_at = ? WHERE id = ?', ('offline', utc_now(), source_id))
             return jsonify_error(f'配置读取失败：{exc}', 502)
@@ -575,7 +642,7 @@ def api_source_sites(source_id):
                 'result': json.loads(pref['result']) if pref.get('result') else None,
                 'checked_at': pref.get('checked_at'),
             })
-        return jsonify_success(data=sites)
+        return jsonify_success(data=sites, changes=changes if refresh else None)
 
 
 @app.route('/api/site/enable', methods=['POST'])
@@ -819,6 +886,11 @@ def api_group_analyze():
         outcomes = list(executor.map(classify, selected))
     results, errors = [], []
     with get_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        latest_groups = [dict(row) for row in db.execute('''SELECT id, name, description
+            FROM site_groups WHERE user_id = ? ORDER BY order_index, id''', (session['user_id'],))]
+        if latest_groups != groups:
+            return jsonify_error('分组定义已变化，本次建议未保存，请重新分析', 409)
         for source_id, key, result, error in outcomes:
             if error:
                 errors.append({'source_id': source_id, 'key': key, 'message': error})
@@ -870,7 +942,15 @@ def api_site_probe():
             return jsonify_error(f'配置读取失败：{exc}', 502)
         site = next((item for item in config['sites'] if isinstance(item, dict) and site_key(item) == key), None)
         if not site: return jsonify_error('站点不存在', 404)
-        result = probe_site(site, keyword)
+        config_body = db.execute('SELECT body FROM source_configs WHERE source_id = ?', (source_id,)).fetchone()['body']
+    result = probe_site(site, keyword)
+    with get_db() as db:
+        db.execute('BEGIN IMMEDIATE')
+        if not source_for_user(db, source_id, session['user_id']):
+            return jsonify_error('配置来源已移除，探测结果未保存', 409)
+        latest = db.execute('SELECT body FROM source_configs WHERE source_id = ?', (source_id,)).fetchone()
+        if not latest or latest['body'] != config_body:
+            return jsonify_error('原配置已更新，探测结果未保存，请重新探测', 409)
         db.execute('''INSERT INTO site_preferences (source_id, site_key, result, checked_at)
             VALUES (?, ?, ?, ?) ON CONFLICT(source_id, site_key)
             DO UPDATE SET result = excluded.result, checked_at = excluded.checked_at''',

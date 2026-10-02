@@ -53,18 +53,22 @@ def cms_url(api, **params):
 
 
 def first_video(data):
-    if not isinstance(data, dict):
-        return None
+    if not isinstance(data, dict) or not isinstance(data.get('list'), list):
+        raise ValueError('响应不包含有效的 CMS list 列表')
     items = data.get('list')
-    if not isinstance(items, list) or not items:
+    if not items:
         return None
-    return items[0] if isinstance(items[0], dict) else None
+    if not isinstance(items[0], dict):
+        raise ValueError('CMS 列表条目格式无效')
+    return items[0]
 
 
 def parse_video(body, kind):
     if kind != 0:
         return first_video(json.loads(body.decode('utf-8-sig')))
     root = ElementTree.fromstring(body)
+    if root.tag != 'list' and root.find('.//list') is None:
+        raise ValueError('响应不包含有效的 CMS list 列表')
     video = root.find('.//video')
     if video is None:
         return None
@@ -142,15 +146,19 @@ def probe_site(site, keyword='测试'):
         except (requests.RequestException, ValueError, UnicodeError) as exc:
             return {'status': 'failed', 'stage': 'resource', 'error': str(exc)[:180]}
     if kind not in (0, 1, 4) or not api.startswith(('http://', 'https://')):
-        return {'status': 'unsupported', 'stage': 'CMS 外部探测不支持此类站点'}
+        result = {'status': 'unsupported', 'stage': 'CMS 外部探测不支持此类站点'}
+        if kind in (0, 1, 4):
+            result['keyword'] = keyword
+        return result
     stage = 'search'
-    metrics = {}
+    metrics = {'keyword': keyword}
     try:
         body, search_ms = fetch_limited(cms_url(api, ac='detail', wd=keyword))
         metrics['search_ms'] = search_ms
         video = parse_video(body, kind)
         if not video:
-            return {'status': 'failed', 'stage': 'search', **metrics}
+            return {'status': 'no_match', 'stage': 'search',
+                    'message': '接口可达，但未找到匹配内容；可换搜索词重试', **metrics}
         vod_id = video.get('vod_id') or video.get('id')
         if not vod_id:
             return {'status': 'failed', 'stage': 'detail', **metrics}
